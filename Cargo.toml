@@ -2,7 +2,7 @@
 name         = "base94-simd"
 version      = "0.1.1"
 edition      = "2024"
-rust-version = "1.89" # AVX-512 intrinsics stabilized in 1.89
+rust-version = "1.89"  # AVX-512 intrinsics stabilized in 1.89
 description  = "SIMD-accelerated base94 codec"
 readme       = "README.md"
 homepage     = "https://github.com/lxl66566/base94-simd"
@@ -10,7 +10,33 @@ repository   = "https://github.com/lxl66566/base94-simd"
 license      = "MIT OR Apache-2.0"
 keywords     = ["ascii", "base94", "encoding", "printable", "simd"]
 categories   = ["encoding"]
-exclude      = ["fuzz"]
+include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
+
+[[bench]]
+harness = false
+name    = "codec"
+
+[dependencies]
+hotpath = { version = "0.23", optional = true }
+
+[dev-dependencies]
+criterion   = { version = "0.8", default-features = false, features = [
+  "html_reports",
+] }
+# Faithful port of the base94 crate's original BigUint algorithm for the
+# comparison bench only (the base94 crate itself is intentionally not a
+# dependency).
+num-bigint  = { version = "0.5", default-features = false }
+num-integer = { version = "0.1", default-features = false }
+num-traits  = { version = "0.2", default-features = false }
+
+[features]
+# Profiling instrumentation (noop and zero-cost when off); the encode/decode
+# entry points are the hottest functions in the nextppp data plane.
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+# key-mixing variants (`*_kf`): bytes are pre-mixed as `(b - kf) mod 256`
+# before encoding. Off by default; the plain codec is the `kf = 0` identity either way.
+kf      = []
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -25,33 +51,6 @@ wildcard_imports        = "allow"
 [lints.rust]
 unsafe_code           = "allow"
 unused_qualifications = "warn"
-
-[features]
-# key-mixing variants (`*_kf`): bytes are pre-mixed as `(b - kf) mod 256`
-# before encoding. Off by default; the plain codec is the
-# `kf = 0` identity either way.
-kf = []
-# Profiling instrumentation (noop and zero-cost when off); the encode/decode
-# entry points are the hottest functions in the nextppp data plane.
-hotpath = ["dep:hotpath", "hotpath/hotpath"]
-
-[dependencies]
-hotpath = { version = "0.23", optional = true }
-
-[dev-dependencies]
-criterion = { version = "0.8", default-features = false, features = [
-    "html_reports",
-] }
-# Faithful port of the base94 crate's original BigUint algorithm for the
-# comparison bench only (the base94 crate itself is intentionally not a
-# dependency).
-num-bigint = { version = "0.4", default-features = false }
-num-integer = { version = "0.1", default-features = false }
-num-traits = { version = "0.2", default-features = false }
-
-[[bench]]
-name    = "codec"
-harness = false
 
 [profile.release]
 codegen-units = 1

@@ -4,11 +4,12 @@
 //! algorithm (BigUint base conversion, MIT) is copied below verbatim in
 //! structure, so the comparison measures the algorithm, not a rewrite.
 
+use std::hint::black_box;
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use num_bigint::BigUint;
 use num_integer::Integer;
 use num_traits::ToPrimitive;
-use std::hint::black_box;
 
 // ---- Copied from base94 0.3.0 (Antosser/base94-rs, MIT) ----
 

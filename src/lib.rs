@@ -9,14 +9,12 @@
 //! wire compatibility with `ppp/cryptography/ssea.cpp`.
 //!
 //! Performance notes (wire output unchanged):
-//! * encode/decode run SIMD fast paths over 64-byte blocks (AVX-512
-//!   F/BW/VBMI/VBMI2 + BMI2 on x86_64, runtime-detected): the decoder solves
-//!   the leader/follower alternation on scalar `u64` masks, reconstructs
-//!   escapes in u8 lanes (`ev = b + 93 + 93*(prev == 0x7E)`) and compacts
-//!   leaders with a single `vpcompressb`; the encoder interleaves
-//!   leader/follower pairs with `vpermt2b` and drops non-escape followers
-//!   through `vpcompressb` (`pdep` spreads the escape mask). 16-byte SSSE3
-//!   (pshufb LUT) / NEON (`vqtbl1`) kernels cover smaller blocks and other
+//! * encode/decode run SIMD fast paths over 64-byte blocks (AVX-512 F/BW/VBMI/VBMI2 + BMI2 on
+//!   x86_64, runtime-detected): the decoder solves the leader/follower alternation on scalar `u64`
+//!   masks, reconstructs escapes in u8 lanes (`ev = b + 93 + 93*(prev == 0x7E)`) and compacts
+//!   leaders with a single `vpcompressb`; the encoder interleaves leader/follower pairs with
+//!   `vpermt2b` and drops non-escape followers through `vpcompressb` (`pdep` spreads the escape
+//!   mask). 16-byte SSSE3 (pshufb LUT) / NEON (`vqtbl1`) kernels cover smaller blocks and other
 //!   machines; validation folds into the kernels, so no upfront scan.
 //! * Invalid input and sub-block tails fall back to the scalar reference loop, so error semantics
 //!   stay bit-exact (pinned by fuzz + unit tests).
@@ -110,13 +108,21 @@ fn len_impl<const KF: bool>(src: &[u8], kf8: u8) -> usize {
 /// `(b - kf) mod 256` when `KF`, identity otherwise (compile-time).
 #[inline]
 const fn mix<const KF: bool>(b: u8, kf8: u8) -> u8 {
-    if KF { b.wrapping_sub(kf8) } else { b }
+    if KF {
+        b.wrapping_sub(kf8)
+    } else {
+        b
+    }
 }
 
 /// `(b + kf) mod 256` when `KF`, identity otherwise (compile-time).
 #[inline]
 const fn unmix<const KF: bool>(b: u8, kf8: u8) -> u8 {
-    if KF { b.wrapping_add(kf8) } else { b }
+    if KF {
+        b.wrapping_add(kf8)
+    } else {
+        b
+    }
 }
 
 /// Shared encode body. Branchless scalar tail: the leader char is always
@@ -159,7 +165,11 @@ fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usiz
             // Escape: c1 = 0x7D + (v >= 186), c2 = 0x20 + v - 93 - 93*(v >= 186).
             // Single: c1 = 0x20 + v (c2 unused, overwritten by a later leader).
             let q2 = u8::from(v >= 2 * ESCAPE_RADIX);
-            let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
+            let c1 = if esc != 0 {
+                0x7d + q2
+            } else {
+                0x20 + v
+            };
             let c2 = 0x20u8.wrapping_add(
                 v.wrapping_sub(ESCAPE_RADIX)
                     .wrapping_sub(ESCAPE_RADIX.wrapping_mul(q2)),
@@ -178,7 +188,11 @@ fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usiz
         let v = mix::<KF>(b, kf8);
         let esc = u8::from(v >= ESCAPE_RADIX);
         let q2 = u8::from(v >= 2 * ESCAPE_RADIX);
-        let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
+        let c1 = if esc != 0 {
+            0x7d + q2
+        } else {
+            0x20 + v
+        };
         let c2 = 0x20u8.wrapping_add(
             v.wrapping_sub(ESCAPE_RADIX)
                 .wrapping_sub(ESCAPE_RADIX.wrapping_mul(q2)),
@@ -256,7 +270,11 @@ fn decode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8) -> Result
         if bad != 0 {
             return Err(DecodeError);
         }
-        let val = if esc != 0 { v_esc } else { b };
+        let val = if esc != 0 {
+            v_esc
+        } else {
+            b
+        };
         // SAFETY: at most one output byte per input char, and `p` advanced
         // only by committed bytes within the reserved capacity.
         unsafe { *dst.add(p) = unmix::<KF>(val as u8, kf8) };

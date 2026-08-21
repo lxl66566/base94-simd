@@ -28,7 +28,11 @@ mod scalar {
     pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         let mut count = 0usize;
         for &b in src {
-            let v = if KF { b.wrapping_sub(sub) } else { b };
+            let v = if KF {
+                b.wrapping_sub(sub)
+            } else {
+                b
+            };
             count += usize::from(v >= threshold);
         }
         count
@@ -136,7 +140,11 @@ mod arch512 {
     /// 0..32, HI inputs 32..64.
     const fn build_interleave_idx(hi: bool) -> [u8; 64] {
         let mut t = [0u8; 64];
-        let base = if hi { 32usize } else { 0 };
+        let base = if hi {
+            32usize
+        } else {
+            0
+        };
         let mut i = 0;
         while i < 32 {
             t[2 * i] = (base + i) as u8;
@@ -191,7 +199,11 @@ mod arch512 {
             let mut off = 0usize;
             for _ in 0..n_blocks {
                 let b = _mm512_loadu_si512(src.as_ptr().add(off).cast());
-                let v = if KF { _mm512_sub_epi8(b, kf_vec) } else { b };
+                let v = if KF {
+                    _mm512_sub_epi8(b, kf_vec)
+                } else {
+                    b
+                };
                 let esc = _mm512_cmpge_epu8_mask(v, c93);
                 let hi = _mm512_cmpge_epu8_mask(v, c186);
 
@@ -310,7 +322,11 @@ mod arch512 {
 
                 // val = follower ? esc_val : (c-0x20), plus kf (wrapping).
                 let val = _mm512_mask_blend_epi8(fmask, b, ev8);
-                let val = if KF { _mm512_add_epi8(val, kf_vec) } else { val };
+                let val = if KF {
+                    _mm512_add_epi8(val, kf_vec)
+                } else {
+                    val
+                };
 
                 // Compact out the effective-leader lanes in one instruction.
                 let produced = 64 - e.count_ones() as usize;
@@ -365,7 +381,11 @@ mod arch512 {
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 64 bytes.
             let v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
-            let v = if KF { _mm512_sub_epi8(v, vsub) } else { v };
+            let v = if KF {
+                _mm512_sub_epi8(v, vsub)
+            } else {
+                v
+            };
             let m = _mm512_cmpge_epu8_mask(v, vt);
             acc += u64::from(m.count_ones());
         }
@@ -434,7 +454,11 @@ mod arch {
             let mut off = 0usize;
             for _ in 0..n_blocks {
                 let b = _mm_loadu_si128(src.as_ptr().add(off).cast());
-                let v = if KF { _mm_sub_epi8(b, kf_vec) } else { b };
+                let v = if KF {
+                    _mm_sub_epi8(b, kf_vec)
+                } else {
+                    b
+                };
                 let flipped = _mm_xor_si128(v, flip);
                 let esc = _mm_cmpgt_epi8(flipped, esc_bound);
                 let hi = _mm_cmpgt_epi8(flipped, hi_bound);
@@ -640,7 +664,11 @@ mod arch {
 
                 // val = follower ? esc_val : (c - 0x20), plus kf (wrapping).
                 let val = _mm_or_si128(_mm_and_si128(fmask, ev8), _mm_andnot_si128(fmask, b));
-                let val = if KF { _mm_add_epi8(val, kf_vec) } else { val };
+                let val = if KF {
+                    _mm_add_epi8(val, kf_vec)
+                } else {
+                    val
+                };
 
                 // Compact out the leader lanes via the pshufb LUT. The two
                 // 8-lane halves use *their own* mask rows: a row's low half
@@ -713,7 +741,11 @@ mod arch {
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
-            let v = if KF { unsafe { _mm_sub_epi8(v, vsub) } } else { v };
+            let v = if KF {
+                unsafe { _mm_sub_epi8(v, vsub) }
+            } else {
+                v
+            };
             let m = unsafe { _mm_cmpgt_epi8(_mm_xor_si128(v, flip), vbound) };
             acc += (unsafe { _mm_movemask_epi8(m) } as u32).count_ones();
         }
@@ -788,7 +820,11 @@ mod arch {
             let mut off = 0usize;
             for _ in 0..n_blocks {
                 let b = vld1q_u8(src.as_ptr().add(off));
-                let v = if KF { vsubq_u8(b, kf_vec) } else { b };
+                let v = if KF {
+                    vsubq_u8(b, kf_vec)
+                } else {
+                    b
+                };
                 let esc = vcgeq_u8(v, esc_v);
                 let hi = vcgeq_u8(v, hi_v);
 
@@ -955,7 +991,11 @@ mod arch {
 
                 // val = follower ? esc_val : (c - 0x20), plus kf (wrapping).
                 let val = vbslq_u8(fmask, ev8, b);
-                let val = if KF { vaddq_u8(val, kf_vec) } else { val };
+                let val = if KF {
+                    vaddq_u8(val, kf_vec)
+                } else {
+                    val
+                };
 
                 // Compact out the leader lanes via the shared LUT: row low
                 // halves pack lanes 0..8; the high-half rows pack lanes
@@ -1022,7 +1062,11 @@ mod arch {
                 let vsub = vdupq_n_u8(sub);
                 let vt = vdupq_n_u8(threshold);
                 let v = vld1q_u8(c.as_ptr());
-                let v = if KF { vsubq_u8(v, vsub) } else { v };
+                let v = if KF {
+                    vsubq_u8(v, vsub)
+                } else {
+                    v
+                };
                 let m = vcgeq_u8(v, vt);
                 acc += u32::from(vaddvq_u8(vandq_u8(m, vdupq_n_u8(1))));
             }
