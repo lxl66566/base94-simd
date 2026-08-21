@@ -376,9 +376,9 @@ mod arch512 {
         // SAFETY: feature set guaranteed by the caller; chunk loads only.
         let vsub = _mm512_set1_epi8(sub as i8);
         let vt = _mm512_set1_epi8(threshold as i8);
-        let mut chunks = src.chunks_exact(64);
+        let (chunks, remainder) = src.as_chunks::<64>();
         let mut acc = 0u64;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: chunk length is exactly 64 bytes.
             let v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
             let v = if KF {
@@ -389,7 +389,7 @@ mod arch512 {
             let m = _mm512_cmpge_epu8_mask(v, vt);
             acc += u64::from(m.count_ones());
         }
-        acc as usize + super::arch::count_sub_ge::<KF>(chunks.remainder(), sub, threshold)
+        acc as usize + super::arch::count_sub_ge::<KF>(remainder, sub, threshold)
     }
 }
 
@@ -736,9 +736,9 @@ mod arch {
         // Unsigned `x >= t` <=> signed `(x ^ 0x80) > ((t - 1) ^ 0x80)`.
         let vbound = unsafe { _mm_set1_epi8(((threshold - 1) ^ 0x80) as i8) };
         let flip = unsafe { _mm_set1_epi8(-0x80_i8) };
-        let mut chunks = src.chunks_exact(16);
+        let (chunks, remainder) = src.as_chunks::<16>();
         let mut acc = 0u32;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
             let v = if KF {
@@ -749,7 +749,7 @@ mod arch {
             let m = unsafe { _mm_cmpgt_epi8(_mm_xor_si128(v, flip), vbound) };
             acc += (unsafe { _mm_movemask_epi8(m) } as u32).count_ones();
         }
-        acc as usize + super::scalar::count_sub_ge::<KF>(chunks.remainder(), sub, threshold)
+        acc as usize + super::scalar::count_sub_ge::<KF>(remainder, sub, threshold)
     }
 }
 
@@ -1053,9 +1053,9 @@ mod arch {
 
     pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         debug_assert!(threshold >= 1);
-        let mut chunks = src.chunks_exact(16);
+        let (chunks, remainder) = src.as_chunks::<16>();
         let mut acc = 0u32;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: NEON is baseline on aarch64; chunk length is exactly
             // 16 bytes and only data ops follow the load.
             unsafe {
@@ -1071,7 +1071,7 @@ mod arch {
                 acc += u32::from(vaddvq_u8(vandq_u8(m, vdupq_n_u8(1))));
             }
         }
-        acc as usize + super::scalar::count_sub_ge::<KF>(chunks.remainder(), sub, threshold)
+        acc as usize + super::scalar::count_sub_ge::<KF>(remainder, sub, threshold)
     }
 }
 
