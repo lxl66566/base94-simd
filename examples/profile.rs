@@ -23,9 +23,9 @@ fn main() {
     let mut dec = Vec::new();
     for _ in 0..2000 {
         enc.clear();
-        base94_simd::encode_into(&mut enc, &data, 0);
+        base94_simd::encode_into(&mut enc, &data);
         dec.clear();
-        base94_simd::decode_into(&mut dec, &enc, 0).unwrap();
+        base94_simd::decode_into(&mut dec, &enc).unwrap();
     }
     assert_eq!(dec, data);
 }

@@ -35,11 +35,11 @@ fuzz_target!(|data: &[u8]| {
     encode_reference(&mut want, payload, kf);
 
     let mut got = Vec::new();
-    base94_simd::encode_into(&mut got, payload, kf);
+    base94_simd::encode_into_kf(&mut got, payload, kf);
     assert_eq!(got, want, "encode diverged from reference on {payload:?} kf={kf}");
     assert_eq!(
         got.len(),
-        base94_simd::encoded_len(payload, kf),
+        base94_simd::encoded_len_kf(payload, kf),
         "encoded_len diverged on {payload:?} kf={kf}"
     );
 
@@ -47,6 +47,6 @@ fuzz_target!(|data: &[u8]| {
     let mut prefix = Vec::new();
     encode_reference(&mut prefix, b"prefix", kf);
     let mut appended = prefix.clone();
-    base94_simd::encode_into(&mut appended, payload, kf);
+    base94_simd::encode_into_kf(&mut appended, payload, kf);
     assert_eq!(appended, [prefix.as_slice(), want.as_slice()].concat());
 });

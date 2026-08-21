@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
     // (and leave it untouched on error).
     let mut got = b"prefix".to_vec();
     let mut want = b"prefix".to_vec();
-    let a = base94_simd::decode_into(&mut got, input, kf);
+    let a = base94_simd::decode_into_kf(&mut got, input, kf);
     let b = decode_reference(&mut want, input, kf);
     assert_eq!(a.is_ok(), b.is_ok(), "ok-ness diverged on {input:?} kf={kf}");
     if a.is_ok() {

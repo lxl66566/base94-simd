@@ -7,10 +7,10 @@ fuzz_target!(|data: &[u8]| {
     let (&kf, payload) = data.split_first().unwrap_or((&0, &[]));
     let kf = u32::from(kf);
     let mut encoded = Vec::new();
-    base94_simd::encode_into(&mut encoded, payload, kf);
+    base94_simd::encode_into_kf(&mut encoded, payload, kf);
     assert!(encoded.iter().all(|&c| (0x20..=0x7e).contains(&c)));
-    assert_eq!(encoded.len(), base94_simd::encoded_len(payload, kf));
+    assert_eq!(encoded.len(), base94_simd::encoded_len_kf(payload, kf));
     let mut decoded = Vec::new();
-    base94_simd::decode_into(&mut decoded, &encoded, kf).expect("own encoding must decode");
+    base94_simd::decode_into_kf(&mut decoded, &encoded, kf).expect("own encoding must decode");
     assert_eq!(decoded, payload);
 });

@@ -25,10 +25,11 @@
 // drive them directly.
 #[allow(dead_code)]
 mod scalar {
-    pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+    pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         let mut count = 0usize;
         for &b in src {
-            count += usize::from(b.wrapping_sub(sub) >= threshold);
+            let v = if KF { b.wrapping_sub(sub) } else { b };
+            count += usize::from(v >= threshold);
         }
         count
     }
@@ -159,7 +160,12 @@ mod arch512 {
     /// caller must reserve 64 bytes of store slack (the final compaction
     /// store writes a full register).
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2")]
-    pub(super) fn encode_simd(dst_ptr: *mut u8, pos: &mut usize, src: &[u8], kf8: u8) -> usize {
+    pub(super) fn encode_simd<const KF: bool>(
+        dst_ptr: *mut u8,
+        pos: &mut usize,
+        src: &[u8],
+        kf8: u8,
+    ) -> usize {
         const EVEN: u64 = 0x5555_5555_5555_5555;
         let n_blocks = src.len() / 64;
         if n_blocks == 0 {
@@ -185,7 +191,7 @@ mod arch512 {
             let mut off = 0usize;
             for _ in 0..n_blocks {
                 let b = _mm512_loadu_si512(src.as_ptr().add(off).cast());
-                let v = _mm512_sub_epi8(b, kf_vec);
+                let v = if KF { _mm512_sub_epi8(b, kf_vec) } else { b };
                 let esc = _mm512_cmpge_epu8_mask(v, c93);
                 let hi = _mm512_cmpge_epu8_mask(v, c186);
 
@@ -233,7 +239,7 @@ mod arch512 {
     /// to u16 lanes (and back) needed.
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2")]
     #[allow(clippy::too_many_lines)]
-    pub(super) fn decode_simd(
+    pub(super) fn decode_simd<const KF: bool>(
         dst_ptr: *mut u8,
         pos: &mut usize,
         src: &[u8],
@@ -303,7 +309,8 @@ mod arch512 {
                 }
 
                 // val = follower ? esc_val : (c-0x20), plus kf (wrapping).
-                let val = _mm512_add_epi8(_mm512_mask_blend_epi8(fmask, b, ev8), kf_vec);
+                let val = _mm512_mask_blend_epi8(fmask, b, ev8);
+                let val = if KF { _mm512_add_epi8(val, kf_vec) } else { val };
 
                 // Compact out the effective-leader lanes in one instruction.
                 let produced = 64 - e.count_ones() as usize;
@@ -330,7 +337,11 @@ mod arch512 {
                             *pos = safe.1;
                             return Err(safe);
                         }
-                        *dst_ptr.add(*pos) = (v_esc as u8).wrapping_add(kf8);
+                        *dst_ptr.add(*pos) = if KF {
+                            (v_esc as u8).wrapping_add(kf8)
+                        } else {
+                            v_esc as u8
+                        };
                         *pos += 1;
                         off += 1;
                         carry = false;
@@ -345,7 +356,7 @@ mod arch512 {
     }
 
     #[target_feature(enable = "avx512f,avx512bw")]
-    pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+    pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         // SAFETY: feature set guaranteed by the caller; chunk loads only.
         let vsub = _mm512_set1_epi8(sub as i8);
         let vt = _mm512_set1_epi8(threshold as i8);
@@ -354,10 +365,11 @@ mod arch512 {
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 64 bytes.
             let v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
-            let m = _mm512_cmpge_epu8_mask(_mm512_sub_epi8(v, vsub), vt);
+            let v = if KF { _mm512_sub_epi8(v, vsub) } else { v };
+            let m = _mm512_cmpge_epu8_mask(v, vt);
             acc += u64::from(m.count_ones());
         }
-        acc as usize + super::arch::count_sub_ge(chunks.remainder(), sub, threshold)
+        acc as usize + super::arch::count_sub_ge::<KF>(chunks.remainder(), sub, threshold)
     }
 }
 
@@ -389,7 +401,12 @@ mod arch {
     /// Requires SSSE3; the dispatcher runtime-detects it before calling.
     #[target_feature(enable = "ssse3")]
     #[allow(clippy::too_many_lines)]
-    pub(super) fn encode_simd(dst_ptr: *mut u8, pos: &mut usize, src: &[u8], kf8: u8) -> usize {
+    pub(super) fn encode_simd<const KF: bool>(
+        dst_ptr: *mut u8,
+        pos: &mut usize,
+        src: &[u8],
+        kf8: u8,
+    ) -> usize {
         let n_blocks = src.len() / 16;
         if n_blocks == 0 {
             return 0;
@@ -417,7 +434,7 @@ mod arch {
             let mut off = 0usize;
             for _ in 0..n_blocks {
                 let b = _mm_loadu_si128(src.as_ptr().add(off).cast());
-                let v = _mm_sub_epi8(b, kf_vec);
+                let v = if KF { _mm_sub_epi8(b, kf_vec) } else { b };
                 let flipped = _mm_xor_si128(v, flip);
                 let esc = _mm_cmpgt_epi8(flipped, esc_bound);
                 let hi = _mm_cmpgt_epi8(flipped, hi_bound);
@@ -488,7 +505,7 @@ mod arch {
     /// Requires SSSE3; the dispatcher runtime-detects it before calling.
     #[target_feature(enable = "ssse3")]
     #[allow(clippy::too_many_lines)]
-    pub(super) fn decode_simd(
+    pub(super) fn decode_simd<const KF: bool>(
         dst_ptr: *mut u8,
         pos: &mut usize,
         src: &[u8],
@@ -622,10 +639,8 @@ mod arch {
                 let ev8 = _mm_packus_epi16(_mm_and_si128(ev_lo, c255), _mm_and_si128(ev_hi, c255));
 
                 // val = follower ? esc_val : (c - 0x20), plus kf (wrapping).
-                let val = _mm_add_epi8(
-                    _mm_or_si128(_mm_and_si128(fmask, ev8), _mm_andnot_si128(fmask, b)),
-                    kf_vec,
-                );
+                let val = _mm_or_si128(_mm_and_si128(fmask, ev8), _mm_andnot_si128(fmask, b));
+                let val = if KF { _mm_add_epi8(val, kf_vec) } else { val };
 
                 // Compact out the leader lanes via the pshufb LUT. The two
                 // 8-lane halves use *their own* mask rows: a row's low half
@@ -667,7 +682,11 @@ mod arch {
                             *pos = safe.1;
                             return Err(safe);
                         }
-                        *dst_ptr.add(*pos) = (v_esc as u8).wrapping_add(kf8);
+                        *dst_ptr.add(*pos) = if KF {
+                            (v_esc as u8).wrapping_add(kf8)
+                        } else {
+                            v_esc as u8
+                        };
                         *pos += 1;
                         off += 1;
                         carry = false;
@@ -681,7 +700,7 @@ mod arch {
         }
     }
 
-    pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+    pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         debug_assert!(threshold >= 1);
         // SAFETY: SSE2 is baseline on x86_64; intrinsics are plain data
         // shuffles with no memory unsafety beyond the block loads below.
@@ -693,11 +712,12 @@ mod arch {
         let mut acc = 0u32;
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 16 bytes.
-            let v = unsafe { _mm_sub_epi8(_mm_loadu_si128(c.as_ptr().cast()), vsub) };
+            let v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
+            let v = if KF { unsafe { _mm_sub_epi8(v, vsub) } } else { v };
             let m = unsafe { _mm_cmpgt_epi8(_mm_xor_si128(v, flip), vbound) };
             acc += (unsafe { _mm_movemask_epi8(m) } as u32).count_ones();
         }
-        acc as usize + super::scalar::count_sub_ge(chunks.remainder(), sub, threshold)
+        acc as usize + super::scalar::count_sub_ge::<KF>(chunks.remainder(), sub, threshold)
     }
 }
 
@@ -739,7 +759,12 @@ mod arch {
     /// NEON compares are natively unsigned, so the x86 ^0x80 flip trick and
     /// its boundary constants disappear.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn encode_simd(dst_ptr: *mut u8, pos: &mut usize, src: &[u8], kf8: u8) -> usize {
+    pub(super) fn encode_simd<const KF: bool>(
+        dst_ptr: *mut u8,
+        pos: &mut usize,
+        src: &[u8],
+        kf8: u8,
+    ) -> usize {
         let n_blocks = src.len() / 16;
         if n_blocks == 0 {
             return 0;
@@ -763,7 +788,7 @@ mod arch {
             let mut off = 0usize;
             for _ in 0..n_blocks {
                 let b = vld1q_u8(src.as_ptr().add(off));
-                let v = vsubq_u8(b, kf_vec);
+                let v = if KF { vsubq_u8(b, kf_vec) } else { b };
                 let esc = vcgeq_u8(v, esc_v);
                 let hi = vcgeq_u8(v, hi_v);
 
@@ -810,7 +835,7 @@ mod arch {
     /// backend for the algorithm, the hand-off invariant and the
     /// store-capacity safety contract.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn decode_simd(
+    pub(super) fn decode_simd<const KF: bool>(
         dst_ptr: *mut u8,
         pos: &mut usize,
         src: &[u8],
@@ -929,7 +954,8 @@ mod arch {
                 let ev8 = vcombine_u8(vmovn_u16(ev_lo), vmovn_u16(ev_hi));
 
                 // val = follower ? esc_val : (c - 0x20), plus kf (wrapping).
-                let val = vaddq_u8(vbslq_u8(fmask, ev8, b), kf_vec);
+                let val = vbslq_u8(fmask, ev8, b);
+                let val = if KF { vaddq_u8(val, kf_vec) } else { val };
 
                 // Compact out the leader lanes via the shared LUT: row low
                 // halves pack lanes 0..8; the high-half rows pack lanes
@@ -967,7 +993,11 @@ mod arch {
                             *pos = safe.1;
                             return Err(safe);
                         }
-                        *dst_ptr.add(*pos) = (v_esc as u8).wrapping_add(kf8);
+                        *dst_ptr.add(*pos) = if KF {
+                            (v_esc as u8).wrapping_add(kf8)
+                        } else {
+                            v_esc as u8
+                        };
                         *pos += 1;
                         off += 1;
                         carry = false;
@@ -981,7 +1011,7 @@ mod arch {
         }
     }
 
-    pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+    pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         debug_assert!(threshold >= 1);
         let mut chunks = src.chunks_exact(16);
         let mut acc = 0u32;
@@ -992,11 +1022,12 @@ mod arch {
                 let vsub = vdupq_n_u8(sub);
                 let vt = vdupq_n_u8(threshold);
                 let v = vld1q_u8(c.as_ptr());
-                let m = vcgeq_u8(vsubq_u8(v, vsub), vt);
+                let v = if KF { vsubq_u8(v, vsub) } else { v };
+                let m = vcgeq_u8(v, vt);
                 acc += u32::from(vaddvq_u8(vandq_u8(m, vdupq_n_u8(1))));
             }
         }
-        acc as usize + super::scalar::count_sub_ge(chunks.remainder(), sub, threshold)
+        acc as usize + super::scalar::count_sub_ge::<KF>(chunks.remainder(), sub, threshold)
     }
 }
 
@@ -1006,37 +1037,43 @@ use arch as selected;
 use scalar as selected;
 
 /// Counts bytes where `b.wrapping_sub(sub) >= threshold` (`threshold >= 1`).
-pub(crate) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+/// `KF=false` instantiations skip the subtraction entirely.
+pub(crate) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
     #[cfg(target_arch = "x86_64")]
     if arch512::have() {
         // SAFETY: feature set verified by `have`.
-        return unsafe { arch512::count_sub_ge(src, sub, threshold) };
+        return unsafe { arch512::count_sub_ge::<KF>(src, sub, threshold) };
     }
-    selected::count_sub_ge(src, sub, threshold)
+    selected::count_sub_ge::<KF>(src, sub, threshold)
 }
 
 /// SIMD encode fast path (x86_64: AVX-512/VBMI2 preferred with the SSSE3
 /// kernel chained for the 16..63-byte tail, both runtime-detected; aarch64
 /// uses baseline NEON; other targets use the scalar loop). Returns the
 /// consumed source prefix (multiple of 16).
-pub(crate) fn encode_simd(dst_ptr: *mut u8, p: &mut usize, src: &[u8], kf8: u8) -> usize {
+pub(crate) fn encode_simd<const KF: bool>(
+    dst_ptr: *mut u8,
+    p: &mut usize,
+    src: &[u8],
+    kf8: u8,
+) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         let mut consumed = 0usize;
         if arch512::have() {
             // SAFETY: feature set verified by `have`.
-            consumed += unsafe { arch512::encode_simd(dst_ptr, p, &src[consumed..], kf8) };
+            consumed += unsafe { arch512::encode_simd::<KF>(dst_ptr, p, &src[consumed..], kf8) };
         }
         if src.len() - consumed >= 16 && std::arch::is_x86_feature_detected!("ssse3") {
             // SAFETY: SSSE3 support was just detected.
-            consumed += unsafe { arch::encode_simd(dst_ptr, p, &src[consumed..], kf8) };
+            consumed += unsafe { arch::encode_simd::<KF>(dst_ptr, p, &src[consumed..], kf8) };
         }
         consumed
     }
     #[cfg(target_arch = "aarch64")]
     {
         // NEON is baseline on aarch64 — no runtime detection needed.
-        arch::encode_simd(dst_ptr, p, src, kf8)
+        arch::encode_simd::<KF>(dst_ptr, p, src, kf8)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -1049,7 +1086,7 @@ pub(crate) fn encode_simd(dst_ptr: *mut u8, p: &mut usize, src: &[u8], kf8: u8) 
 /// kernel chained for the 16..63-byte tail, both runtime-detected; aarch64
 /// uses baseline NEON; other targets decode with the scalar reference loop).
 /// See the SSSE3 kernel for semantics.
-pub(crate) fn decode_simd(
+pub(crate) fn decode_simd<const KF: bool>(
     dst_ptr: *mut u8,
     p: &mut usize,
     src: &[u8],
@@ -1060,7 +1097,7 @@ pub(crate) fn decode_simd(
         let mut consumed = 0usize;
         if arch512::have() {
             // SAFETY: feature set verified by `have`.
-            match unsafe { arch512::decode_simd(dst_ptr, p, src, kf8) } {
+            match unsafe { arch512::decode_simd::<KF>(dst_ptr, p, src, kf8) } {
                 // On success no cross-block pair is pending, so the SSSE3
                 // kernel can resume the < 64-byte tail without context.
                 Ok((c, _)) => consumed = c,
@@ -1069,7 +1106,7 @@ pub(crate) fn decode_simd(
         }
         if src.len() - consumed >= 16 && std::arch::is_x86_feature_detected!("ssse3") {
             // SAFETY: SSSE3 support was just detected.
-            return match unsafe { arch::decode_simd(dst_ptr, p, &src[consumed..], kf8) } {
+            return match unsafe { arch::decode_simd::<KF>(dst_ptr, p, &src[consumed..], kf8) } {
                 Ok((c2, _)) => Ok((consumed + c2, *p)),
                 Err((c2, _)) => Err((consumed + c2, *p)),
             };
@@ -1079,7 +1116,7 @@ pub(crate) fn decode_simd(
     #[cfg(target_arch = "aarch64")]
     {
         // NEON is baseline on aarch64 — no runtime detection needed.
-        arch::decode_simd(dst_ptr, p, src, kf8)
+        arch::decode_simd::<KF>(dst_ptr, p, src, kf8)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -1110,9 +1147,14 @@ mod tests {
             let src = sample(n);
             for kf in [0u8, 1, 0x5a, 0xa7] {
                 assert_eq!(
-                    count_sub_ge(&src, kf, 93),
-                    scalar::count_sub_ge(&src, kf, 93),
+                    count_sub_ge::<true>(&src, kf, 93),
+                    scalar::count_sub_ge::<true>(&src, kf, 93),
                     "count n={n} kf={kf}"
+                );
+                assert_eq!(
+                    count_sub_ge::<false>(&src, 0, 93),
+                    scalar::count_sub_ge::<false>(&src, 0, 93),
+                    "count-plain n={n}"
                 );
             }
         }

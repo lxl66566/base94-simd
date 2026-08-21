@@ -66,7 +66,7 @@ fn bench_encode(c: &mut Criterion) {
             let mut out = Vec::new();
             b.iter(|| {
                 out.clear();
-                base94_simd::encode_into(black_box(&mut out), black_box(data), 0);
+                base94_simd::encode_into(black_box(&mut out), black_box(data));
             });
         });
         if size <= 16 * 1024 {
@@ -87,13 +87,13 @@ fn bench_decode(c: &mut Criterion) {
     for size in [64usize, 1024, 16 * 1024, 64 * 1024, 1024 * 1024] {
         let data = sample(size);
         let mut encoded = Vec::new();
-        base94_simd::encode_into(&mut encoded, &data, 0);
+        base94_simd::encode_into(&mut encoded, &data);
         g.throughput(Throughput::Bytes(encoded.len() as u64));
         g.bench_with_input(BenchmarkId::new("base94-simd", size), &encoded, |b, enc| {
             let mut out = Vec::new();
             b.iter(|| {
                 out.clear();
-                base94_simd::decode_into(black_box(&mut out), black_box(enc), 0).unwrap();
+                base94_simd::decode_into(black_box(&mut out), black_box(enc)).unwrap();
             });
         });
         if size <= 16 * 1024 {

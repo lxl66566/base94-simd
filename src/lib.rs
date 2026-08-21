@@ -1,10 +1,12 @@
 //! SIMD-accelerated base94 codec: binary data in printable ASCII.
 //!
-//! Each byte `b` maps to `(b - kf) mod 256`; mixed values `>= 93` escape into
-//! two chars (`0x7D`/`0x7E` leader + follower) so every emitted char stays in
-//! `0x20..=0x7E` and the output is at most 2x the input. `kf` is a key-mixing
-//! parameter (only its low byte participates); pass `0` for the plain codec.
-//! The format is a faithful port of openppp2 `ppp/cryptography/ssea.cpp`.
+//! Each byte `b` maps to a printable char `0x20 + b`; values `>= 93` escape
+//! into two chars (`0x7D`/`0x7E` leader + follower) so every emitted char
+//! stays in `0x20..=0x7E` and the output is at most 2x the input.
+//!
+//! With the `kf` feature, `*_kf` variants additionally apply the openppp2
+//! key-mixing step (`(b - kf) mod 256`, only the low byte participates) for
+//! wire compatibility with `ppp/cryptography/ssea.cpp`.
 //!
 //! Performance notes (wire output unchanged):
 //! * encode/decode run SIMD fast paths over 64-byte blocks (AVX-512
@@ -51,13 +53,8 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Encodes binary bytes into printable 0x20..=0x7E chars, appending to `out`.
-///
-/// Branchless scalar tail: the leader char is always stored, the follower
-/// slot always written (garbage when unused, overwritten by the next
-/// leader), and the write cursor advances by `1 + escape` — no mispredicted
-/// branches on the ~50/50 escape mix.
-pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
-    encode_into_with_len(out, src, kf, encoded_len(src, kf));
+pub fn encode_into(out: &mut Vec<u8>, src: &[u8]) {
+    encode_impl::<false>(out, src, 0, encoded_len(src));
 }
 
 /// [`encode_into`] with a caller-computed output length, skipping the
@@ -67,19 +64,75 @@ pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
 ///
 /// # Contract
 ///
-/// `len` must be exactly `encoded_len(src, kf)`. A wrong value corrupts or
+/// `len` must be exactly `encoded_len(src)`. A wrong value corrupts or
 /// overruns the output buffer (the writes trust `len` for capacity);
 /// `debug_assert` catches misuse in debug builds.
+pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], len: usize) {
+    encode_impl::<false>(out, src, 0, len);
+}
+
+/// Number of chars [`encode_into`] would emit for `src`.
+#[must_use]
+pub fn encoded_len(src: &[u8]) -> usize {
+    len_impl::<false>(src, 0)
+}
+
+/// Key-mixing variant of [`encode_into`] (openppp2 wire compatibility):
+/// each byte is pre-mixed as `(b - kf) mod 256` before encoding. Only the
+/// low byte of `kf` participates.
+#[cfg(feature = "kf")]
+pub fn encode_into_kf(out: &mut Vec<u8>, src: &[u8], kf: u32) {
+    encode_impl::<true>(out, src, kf as u8, encoded_len_kf(src, kf));
+}
+
+/// Key-mixing variant of [`encode_into_with_len`]; `len` must be exactly
+/// `encoded_len_kf(src, kf)` (same contract).
+#[cfg(feature = "kf")]
+pub fn encode_into_with_len_kf(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) {
+    encode_impl::<true>(out, src, kf as u8, len);
+}
+
+/// Number of chars [`encode_into_kf`] would emit for `src`.
+#[cfg(feature = "kf")]
+#[must_use]
+pub fn encoded_len_kf(src: &[u8], kf: u32) -> usize {
+    len_impl::<true>(src, kf as u8)
+}
+
+/// `KF=false` instantiations erase every mix/unmix op at compile time
+/// (monomorphized const branch), so the plain codec carries zero kf
+/// overhead; `kf8` must be 0 there.
+fn len_impl<const KF: bool>(src: &[u8], kf8: u8) -> usize {
+    debug_assert!(KF || kf8 == 0);
+    src.len() + simd::count_sub_ge::<KF>(src, kf8, ESCAPE_RADIX)
+}
+
+/// `(b - kf) mod 256` when `KF`, identity otherwise (compile-time).
+#[inline]
+const fn mix<const KF: bool>(b: u8, kf8: u8) -> u8 {
+    if KF { b.wrapping_sub(kf8) } else { b }
+}
+
+/// `(b + kf) mod 256` when `KF`, identity otherwise (compile-time).
+#[inline]
+const fn unmix<const KF: bool>(b: u8, kf8: u8) -> u8 {
+    if KF { b.wrapping_add(kf8) } else { b }
+}
+
+/// Shared encode body. Branchless scalar tail: the leader char is always
+/// stored, the follower slot always written (garbage when unused,
+/// overwritten by the next leader), and the write cursor advances by
+/// `1 + escape` — no mispredicted branches on the ~50/50 escape mix.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) {
+fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usize) {
     // 8-wide unroll: the output offsets form a short serial prefix chain
     // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
     // issue independently — a per-byte `p += 1 + esc` chain would otherwise
     // cap the loop at the address-generation latency.
     const UNROLL: usize = 8;
 
-    debug_assert_eq!(len, encoded_len(src, kf), "stale/wrong encode length");
-    let kf8 = kf as u8;
+    debug_assert!(KF || kf8 == 0);
+    debug_assert_eq!(len, len_impl::<KF>(src, kf8), "stale/wrong encode length");
     let total = len;
     let start = out.len();
     // +64 slack: the SIMD kernels' compaction stores are full-register
@@ -89,8 +142,8 @@ pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) 
     out.reserve(total + 64);
     let dst = out.as_mut_ptr();
     let mut p = start;
-    // SIMD fast path over whole 16-byte blocks first.
-    let simd_consumed = simd::encode_simd(dst, &mut p, src, kf8);
+    // SIMD fast path over whole blocks first.
+    let simd_consumed = simd::encode_simd::<KF>(dst, &mut p, src, kf8);
     let mut idx = simd_consumed;
     while idx + UNROLL <= src.len() {
         let chunk: [u8; UNROLL] = src[idx..idx + UNROLL].try_into().expect("fixed size");
@@ -98,10 +151,10 @@ pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) 
         let mut cursor = 0usize;
         for (k, &b) in chunk.iter().enumerate() {
             offs[k] = cursor;
-            cursor += 1 + usize::from(b.wrapping_sub(kf8) >= ESCAPE_RADIX);
+            cursor += 1 + usize::from(mix::<KF>(b, kf8) >= ESCAPE_RADIX);
         }
         for (k, &b) in chunk.iter().enumerate() {
-            let v = b.wrapping_sub(kf8);
+            let v = mix::<KF>(b, kf8);
             let esc = u8::from(v >= ESCAPE_RADIX);
             // Escape: c1 = 0x7D + (v >= 186), c2 = 0x20 + v - 93 - 93*(v >= 186).
             // Single: c1 = 0x20 + v (c2 unused, overwritten by a later leader).
@@ -122,7 +175,7 @@ pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) 
         idx += UNROLL;
     }
     for &b in &src[idx..] {
-        let v = b.wrapping_sub(kf8);
+        let v = mix::<KF>(b, kf8);
         let esc = u8::from(v >= ESCAPE_RADIX);
         let q2 = u8::from(v >= 2 * ESCAPE_RADIX);
         let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
@@ -141,14 +194,19 @@ pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) 
     unsafe { out.set_len(start + total) };
 }
 
-/// Number of chars [`encode_into`] would emit for `src`.
-#[must_use]
-pub fn encoded_len(src: &[u8], kf: u32) -> usize {
-    src.len() + simd::count_sub_ge(src, kf as u8, ESCAPE_RADIX)
-}
-
 /// Decodes base94 text (see [`encode_into`]) and appends the bytes to `out`.
 /// On invalid input `out` is left unchanged and an error is returned.
+pub fn decode_into(out: &mut Vec<u8>, src: &[u8]) -> Result<(), DecodeError> {
+    decode_impl::<false>(out, src, 0)
+}
+
+/// Key-mixing variant of [`decode_into`] (see [`encode_into_kf`]).
+#[cfg(feature = "kf")]
+pub fn decode_into_kf(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeError> {
+    decode_impl::<true>(out, src, kf as u8)
+}
+
+/// Shared decode body.
 ///
 /// A vectorized kernel decodes whole blocks (leader/follower pairing, escape
 /// reconstruction and leader compaction in-register) with validation folded
@@ -158,9 +216,8 @@ pub fn encoded_len(src: &[u8], kf: u32) -> usize {
 /// by wrapping arithmetic: `c.wrapping_sub(0x20)` lands far past every
 /// range bound, so no separate validity scan is needed.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeError> {
-    let kf8 = kf as u8;
-    let kf16 = u16::from(kf8);
+fn decode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8) -> Result<(), DecodeError> {
+    debug_assert!(KF || kf8 == 0);
     let start = out.len();
     // +64 slack for the SIMD kernels' full-register compact stores (see
     // encode_into); the final set_len erases the padding.
@@ -172,7 +229,7 @@ pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeE
     // SIMD fast path over whole 16-char blocks. `Ok` leaves the sub-block
     // tail; `Err` hands back the last valid prefix. Either way the scalar
     // reference loop resumes exactly where the kernel stopped.
-    match simd::decode_simd(dst, &mut p, src, kf8) {
+    match simd::decode_simd::<KF>(dst, &mut p, src, kf8) {
         Ok((consumed, _)) | Err((consumed, _)) => i = consumed,
     }
     // Main loop: every position still has a potential follower char. The
@@ -202,7 +259,7 @@ pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeE
         let val = if esc != 0 { v_esc } else { b };
         // SAFETY: at most one output byte per input char, and `p` advanced
         // only by committed bytes within the reserved capacity.
-        unsafe { *dst.add(p) = val.wrapping_add(kf16) as u8 };
+        unsafe { *dst.add(p) = unmix::<KF>(val as u8, kf8) };
         p += 1;
         i += 1 + esc as usize;
     }
@@ -213,7 +270,7 @@ pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeE
         if b >= ESCAPE_RADIX {
             return Err(DecodeError);
         }
-        unsafe { *dst.add(p) = b.wrapping_add(kf8) };
+        unsafe { *dst.add(p) = unmix::<KF>(b, kf8) };
         p += 1;
     }
     // SAFETY: p - start bytes were committed by the loop above.
@@ -267,14 +324,27 @@ mod tests {
 
     #[test]
     fn roundtrip_and_printable() {
-        for kf in [0u32, 1, 93, 94, 0xff, 0xdead_beef] {
+        let original: Vec<u8> = (0..=u8::MAX).collect();
+        let mut encoded = Vec::new();
+        encode_into(&mut encoded, &original);
+        assert!(encoded.iter().all(|&c| (0x20..=0x7e).contains(&c)));
+        assert_eq!(encoded.len(), encoded_len(&original));
+        let mut decoded = Vec::new();
+        decode_into(&mut decoded, &encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[cfg(feature = "kf")]
+    #[test]
+    fn roundtrip_and_printable_kf() {
+        for kf in [1u32, 93, 94, 0xff, 0xdead_beef] {
             let original: Vec<u8> = (0..=u8::MAX).collect();
             let mut encoded = Vec::new();
-            encode_into(&mut encoded, &original, kf);
+            encode_into_kf(&mut encoded, &original, kf);
             assert!(encoded.iter().all(|&c| (0x20..=0x7e).contains(&c)));
-            assert_eq!(encoded.len(), encoded_len(&original, kf));
+            assert_eq!(encoded.len(), encoded_len_kf(&original, kf));
             let mut decoded = Vec::new();
-            decode_into(&mut decoded, &encoded, kf).unwrap();
+            decode_into_kf(&mut decoded, &encoded, kf).unwrap();
             assert_eq!(decoded, original);
         }
     }
@@ -295,21 +365,34 @@ mod tests {
             .collect();
         let no_escape: Vec<u8> = vec![7u8; 2001];
         for dataset in [all_escape, no_escape] {
-            for kf in [0u32, 0x5a5a_5a5a] {
+            let mut encoded = Vec::new();
+            encode_into(&mut encoded, &dataset);
+            assert_eq!(encoded.len(), encoded_len(&dataset));
+            let mut decoded = Vec::new();
+            decode_into(&mut decoded, &encoded).unwrap();
+            assert_eq!(decoded, dataset);
+            #[cfg(feature = "kf")]
+            {
                 let mut encoded = Vec::new();
-                encode_into(&mut encoded, &dataset, kf);
-                assert_eq!(encoded.len(), encoded_len(&dataset, kf));
+                encode_into_kf(&mut encoded, &dataset, 0x5a5a_5a5a);
+                assert_eq!(encoded.len(), encoded_len_kf(&dataset, 0x5a5a_5a5a));
                 let mut decoded = Vec::new();
-                decode_into(&mut decoded, &encoded, kf).unwrap();
+                decode_into_kf(&mut decoded, &encoded, 0x5a5a_5a5a).unwrap();
                 assert_eq!(decoded, dataset);
             }
         }
         let mut random: Vec<u8> = (0..65_537).map(|_| step()).collect();
         random[0] = 0x93; // force at least one boundary escape
         let mut encoded = Vec::new();
-        encode_into(&mut encoded, &random, 154_543_927);
+        #[cfg(feature = "kf")]
+        encode_into_kf(&mut encoded, &random, 154_543_927);
+        #[cfg(not(feature = "kf"))]
+        encode_into(&mut encoded, &random);
         let mut decoded = Vec::new();
-        decode_into(&mut decoded, &encoded, 154_543_927).unwrap();
+        #[cfg(feature = "kf")]
+        decode_into_kf(&mut decoded, &encoded, 154_543_927).unwrap();
+        #[cfg(not(feature = "kf"))]
+        decode_into(&mut decoded, &encoded).unwrap();
         assert_eq!(decoded, random);
     }
 
@@ -319,17 +402,23 @@ mod tests {
         // encode-into semantics; decode mirrors it).
         let original = vec![0xde, 0xad, 0xbe, 0xef];
         let mut encoded = Vec::new();
-        encode_into(&mut encoded, &original, 123);
+        #[cfg(feature = "kf")]
+        encode_into_kf(&mut encoded, &original, 123);
+        #[cfg(not(feature = "kf"))]
+        encode_into(&mut encoded, &original);
         let mut out = b"prefix".to_vec();
-        decode_into(&mut out, &encoded, 123).unwrap();
+        #[cfg(feature = "kf")]
+        decode_into_kf(&mut out, &encoded, 123).unwrap();
+        #[cfg(not(feature = "kf"))]
+        decode_into(&mut out, &encoded).unwrap();
         assert_eq!(out, [b"prefix".as_slice(), original.as_slice()].concat());
     }
 
     #[test]
     fn escape_boundaries() {
-        // kf = 0: values 93/94 escape, values 0..92 stay single.
+        // Values 93/94 escape, values 0..92 stay single.
         let mut encoded = Vec::new();
-        encode_into(&mut encoded, &[0, 92, 93, 94, 255], 0);
+        encode_into(&mut encoded, &[0, 92, 93, 94, 255]);
         // 0 -> 0x20, 92 -> 0x7C, 93 -> 0x7D 0x20, 94 -> 0x7D 0x21,
         // 255 -> (0x20 + 94, 0x20 + 69) = 0x7E 0x65
         assert_eq!(encoded, [0x20, 0x7c, 0x7d, 0x20, 0x7d, 0x21, 0x7e, 0x65]);
@@ -338,13 +427,13 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         let mut out = Vec::new();
-        assert!(decode_into(&mut out, &[0x1f], 0).is_err());
-        assert!(decode_into(&mut out, &[0x7f], 0).is_err());
-        assert!(decode_into(&mut out, &[0x7d], 0).is_err()); // truncated escape
-        assert!(decode_into(&mut out, &[0x7d, 0x7e], 0).is_err()); // v > 0xFF
-        assert!(decode_into(&mut out, &[0x7e, 0x7e], 0).is_err()); // follower is escape
+        assert!(decode_into(&mut out, &[0x1f]).is_err());
+        assert!(decode_into(&mut out, &[0x7f]).is_err());
+        assert!(decode_into(&mut out, &[0x7d]).is_err()); // truncated escape
+        assert!(decode_into(&mut out, &[0x7d, 0x7e]).is_err()); // v > 0xFF
+        assert!(decode_into(&mut out, &[0x7e, 0x7e]).is_err()); // follower is escape
         // Non-0x20 leader of length 1 (0x7F => b=95) is an invalid escape.
-        assert!(decode_into(&mut out, &[0x7f, 0x20], 0).is_err());
+        assert!(decode_into(&mut out, &[0x7f, 0x20]).is_err());
         assert!(out.is_empty(), "no partial output on failure");
     }
 
@@ -395,10 +484,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn decode_fuzz_matches_reference() {
+    fn fuzz_inputs() -> impl Iterator<Item = Vec<u8>> {
         let mut s = 0x00c0_ffee_d00d_feedu64;
-        let mut next = || {
+        let mut next = move || {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
@@ -407,11 +495,13 @@ mod tests {
         // Bias the alphabet toward the tricky boundary range 0x7B..=0x7F so
         // the adjacent-escape fallback and leader/follower boundaries get
         // hammered; mix in ordinary printable chars and invalid bytes.
-        for len in [
+        [
             0usize, 1, 15, 16, 17, 31, 33, 64, 100, 199, 200, 201, 255, 256, 257, 513,
-        ] {
-            for _ in 0..40 {
-                let input: Vec<u8> = (0..len)
+        ]
+        .into_iter()
+        .flat_map(move |len| {
+            (0..40).map(move |_| {
+                (0..len)
                     .map(|_| {
                         let r = (next() >> 32) as u8;
                         match r % 8 {
@@ -421,16 +511,37 @@ mod tests {
                             _ => r, // sometimes < 0x20 or > 0x7E (invalid)
                         }
                     })
-                    .collect();
-                for kf in [0u32, 77, 0x5a5a_5a5a] {
-                    let mut got = Vec::new();
-                    let mut want = Vec::new();
-                    let a = decode_into(&mut got, &input, kf);
-                    let b = decode_reference(&mut want, &input, kf);
-                    assert_eq!(a.is_ok(), b.is_ok(), "len={len} kf={kf} ok-ness");
-                    if let (Ok(()), Ok(())) = (a, b) {
-                        assert_eq!(got, want, "len={len} kf={kf}");
-                    }
+                    .collect::<Vec<u8>>()
+            })
+        })
+    }
+
+    #[test]
+    fn decode_fuzz_matches_reference() {
+        for input in fuzz_inputs() {
+            let mut got = Vec::new();
+            let mut want = Vec::new();
+            let a = decode_into(&mut got, &input);
+            let b = decode_reference(&mut want, &input, 0);
+            assert_eq!(a.is_ok(), b.is_ok(), "len={} ok-ness", input.len());
+            if let (Ok(()), Ok(())) = (a, b) {
+                assert_eq!(got, want, "len={}", input.len());
+            }
+        }
+    }
+
+    #[cfg(feature = "kf")]
+    #[test]
+    fn decode_fuzz_matches_reference_kf() {
+        for input in fuzz_inputs() {
+            for kf in [77u32, 0x5a5a_5a5a] {
+                let mut got = Vec::new();
+                let mut want = Vec::new();
+                let a = decode_into_kf(&mut got, &input, kf);
+                let b = decode_reference(&mut want, &input, kf);
+                assert_eq!(a.is_ok(), b.is_ok(), "len={} kf={kf} ok-ness", input.len());
+                if let (Ok(()), Ok(())) = (a, b) {
+                    assert_eq!(got, want, "len={} kf={kf}", input.len());
                 }
             }
         }
@@ -444,7 +555,7 @@ mod tests {
         let input: Vec<u8> = b"ppppppppp#i}~C}(".to_vec();
         assert_eq!(input.len(), 16);
         let mut out = Vec::new();
-        assert!(decode_into(&mut out, &input, 125).is_err());
+        assert!(decode_into(&mut out, &input).is_err());
         assert_eq!(out, [] as [u8; 0]);
         // Same construct shifted to other lanes / with a leading carry.
         for shift in 0..15usize {
@@ -452,7 +563,7 @@ mod tests {
             v[shift] = 0x7d;
             v[shift + 1] = 0x7e;
             let mut out = Vec::new();
-            assert!(decode_into(&mut out, &v, 0).is_err(), "shift {shift}");
+            assert!(decode_into(&mut out, &v).is_err(), "shift {shift}");
         }
         // Overflowing escape (ev > 0xFF) inside a SIMD block: 0x7E leader
         // with a large follower, e.g. "7e 7d" -> 186 + 93 = 279.
@@ -460,7 +571,7 @@ mod tests {
         v[0] = 0x7e;
         v[1] = 0x7d;
         let mut out = Vec::new();
-        assert!(decode_into(&mut out, &v, 0).is_err());
+        assert!(decode_into(&mut out, &v).is_err());
         assert_eq!(out, [] as [u8; 0]);
     }
 
@@ -470,13 +581,19 @@ mod tests {
         // the adjacent-escape boundary in the optimized path.
         let mut big = vec![0x7du8; 64];
         big.extend_from_slice(&[0x41; 8]);
-        for kf in [0u32, 200] {
+        let mut got = Vec::new();
+        decode_into(&mut got, &big).unwrap();
+        let mut want = Vec::new();
+        decode_reference(&mut want, &big, 0).unwrap();
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 32 + 8);
+        #[cfg(feature = "kf")]
+        {
             let mut got = Vec::new();
-            decode_into(&mut got, &big, kf).unwrap();
+            decode_into_kf(&mut got, &big, 200).unwrap();
             let mut want = Vec::new();
-            decode_reference(&mut want, &big, kf).unwrap();
+            decode_reference(&mut want, &big, 200).unwrap();
             assert_eq!(got, want);
-            assert_eq!(got.len(), 32 + 8);
         }
     }
 
