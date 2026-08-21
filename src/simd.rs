@@ -32,10 +32,6 @@ mod scalar {
         }
         count
     }
-
-    pub(super) fn all_ge(src: &[u8], threshold: u8) -> bool {
-        src.iter().all(|&b| b >= threshold)
-    }
 }
 
 // Byte-shuffle control tables shared by the x86_64 (pshufb) and aarch64
@@ -108,6 +104,261 @@ mod compact {
         (shuf, cnt)
     }
     pub(super) static COMPACT: ([u8; 256 * 16], [u8; 512]) = build_compact_tables();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+mod arch512 {
+    //! AVX-512 (F/BW/VBMI/VBMI2) kernels over 64-byte blocks, runtime-detected.
+    //! Same wire semantics and hand-off invariants as the SSSE3 kernels; the
+    //! leader/follower bookkeeping moves to scalar `u64` masks (native k-regs
+    //! hand masks over for free) and compaction is a single `vpcompressb`
+    //! instead of four pshufb LUT rounds.
+
+    use core::arch::x86_64::*;
+
+    /// vpermb control: lane i <- lane i-1, lane 0 patched with the previous
+    /// block's last char afterwards.
+    const fn build_shift_idx() -> [u8; 64] {
+        let mut t = [0u8; 64];
+        let mut i = 1;
+        while i < 64 {
+            t[i] = (i - 1) as u8;
+            i += 1;
+        }
+        t
+    }
+    const SHIFT_IDX: [u8; 64] = build_shift_idx();
+
+    /// vpermt2b controls interleaving (c1_i, c2_i) pairs: even lanes pick c1
+    /// (index < 64), odd lanes pick c2 (index >= 64). LO covers inputs
+    /// 0..32, HI inputs 32..64.
+    const fn build_interleave_idx(hi: bool) -> [u8; 64] {
+        let mut t = [0u8; 64];
+        let base = if hi { 32usize } else { 0 };
+        let mut i = 0;
+        while i < 32 {
+            t[2 * i] = (base + i) as u8;
+            t[2 * i + 1] = (64 + base + i) as u8;
+            i += 1;
+        }
+        t
+    }
+    const ILV_LO: [u8; 64] = build_interleave_idx(false);
+    const ILV_HI: [u8; 64] = build_interleave_idx(true);
+
+    pub(super) fn have() -> bool {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+            && std::arch::is_x86_feature_detected!("avx512vbmi2")
+            && std::arch::is_x86_feature_detected!("bmi2")
+    }
+
+    /// AVX-512 encode kernel; same contract as the SSSE3 kernel except the
+    /// caller must reserve 64 bytes of store slack (the final compaction
+    /// store writes a full register).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2")]
+    pub(super) fn encode_simd(dst_ptr: *mut u8, pos: &mut usize, src: &[u8], kf8: u8) -> usize {
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        let n_blocks = src.len() / 64;
+        if n_blocks == 0 {
+            return 0;
+        }
+        // SAFETY: feature set guaranteed by the caller (runtime-detected).
+        // Loads stay inside `src`; stores stay within the caller-reserved
+        // `2*src.len()+64` bytes (each block emits at most 128 bytes;
+        // over-stored compact padding is overwritten by later halves/blocks
+        // or cut by the caller's final `set_len`).
+        unsafe {
+            let kf_vec = _mm512_set1_epi8(kf8 as i8);
+            let c93 = _mm512_set1_epi8(93);
+            let c186 = _mm512_set1_epi8(186u8 as i8);
+            let c20 = _mm512_set1_epi8(0x20);
+            let c2_base = _mm512_set1_epi8(0x20u8.wrapping_sub(93) as i8);
+            let c93b = _mm512_set1_epi8(93);
+            let c7d = _mm512_set1_epi8(0x7d);
+            let one = _mm512_set1_epi8(1);
+            let idx_lo = _mm512_loadu_si512(ILV_LO.as_ptr().cast());
+            let idx_hi = _mm512_loadu_si512(ILV_HI.as_ptr().cast());
+
+            let mut off = 0usize;
+            for _ in 0..n_blocks {
+                let b = _mm512_loadu_si512(src.as_ptr().add(off).cast());
+                let v = _mm512_sub_epi8(b, kf_vec);
+                let esc = _mm512_cmpge_epu8_mask(v, c93);
+                let hi = _mm512_cmpge_epu8_mask(v, c186);
+
+                // c1 = esc ? 0x7D + (v >= 186) : 0x20 + v
+                let c1_esc = _mm512_add_epi8(c7d, _mm512_maskz_mov_epi8(hi, one));
+                let c1 = _mm512_mask_blend_epi8(esc, _mm512_add_epi8(v, c20), c1_esc);
+                // c2 = 0x20 + v - 93 - 93*(v >= 186)
+                let c2 =
+                    _mm512_sub_epi8(_mm512_add_epi8(v, c2_base), _mm512_maskz_mov_epi8(hi, c93b));
+
+                let ilo = _mm512_permutex2var_epi8(c1, idx_lo, c2);
+                let ihi = _mm512_permutex2var_epi8(c1, idx_hi, c2);
+                // Interleaved keep mask: even bits always kept (leader),
+                // odd bits kept on escape. pdep spreads the escape mask to
+                // odd positions.
+                let esc_lo = u64::from(esc as u32);
+                let esc_hi = esc >> 32;
+                let mlo = EVEN | _pdep_u64(esc_lo, !EVEN);
+                let mhi = EVEN | _pdep_u64(esc_hi, !EVEN);
+                _mm512_storeu_si512(
+                    dst_ptr.add(*pos).cast(),
+                    _mm512_maskz_compress_epi8(mlo, ilo),
+                );
+                *pos += 32 + esc_lo.count_ones() as usize;
+                _mm512_storeu_si512(
+                    dst_ptr.add(*pos).cast(),
+                    _mm512_maskz_compress_epi8(mhi, ihi),
+                );
+                *pos += 32 + esc_hi.count_ones() as usize;
+                off += 64;
+            }
+            off
+        }
+    }
+
+    /// AVX-512 decode kernel; semantics, roll-back and trailing-carry
+    /// handling identical to the SSSE3 kernel (which see), over 64-byte
+    /// blocks, except that input validation (`c >= 0x20` included) is done
+    /// in-register — there is no caller pre-scan. The caller must reserve
+    /// 64 bytes of store slack.
+    ///
+    /// The escape value is reconstructed in u8 lanes: with the leader char
+    /// `p` in {0x7D, 0x7E}, `ev = b + 93 + 93*(p == 0x7E)`, and overflow
+    /// past 0xFF happens exactly when `p == 0x7E && b > 69` — no widening
+    /// to u16 lanes (and back) needed.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2")]
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn decode_simd(
+        dst_ptr: *mut u8,
+        pos: &mut usize,
+        src: &[u8],
+        kf8: u8,
+    ) -> Result<(usize, usize), (usize, usize)> {
+        let n_blocks = src.len() / 64;
+        if n_blocks == 0 {
+            return Ok((0, 0));
+        }
+        // SAFETY: feature set guaranteed by the caller (runtime-detected).
+        // Loads are 64-byte block loads inside `src`; stores stay within
+        // the caller-reserved `src.len()+64` bytes past the initial `*pos`.
+        unsafe {
+            let c7d = _mm512_set1_epi8(0x7d);
+            let c7e = _mm512_set1_epi8(0x7e);
+            let c20 = _mm512_set1_epi8(0x20);
+            let c69 = _mm512_set1_epi8(69);
+            let c93 = _mm512_set1_epi8(93);
+            let kf_vec = _mm512_set1_epi8(kf8 as i8);
+            let shift_idx = _mm512_loadu_si512(SHIFT_IDX.as_ptr().cast());
+
+            let mut off = 0usize;
+            let mut carry = false;
+            let mut prev_char = 0u8;
+            let mut safe = (0usize, 0usize);
+            let mut block = 0usize;
+            while block < n_blocks {
+                if !carry {
+                    safe = (off, *pos);
+                }
+                let v = _mm512_loadu_si512(src.as_ptr().add(off).cast());
+                let mut r = _mm512_cmpge_epu8_mask(v, c7d);
+                if carry {
+                    r &= !1u64;
+                }
+                // Runs of 7+ raw leaders are left to the scalar path (see
+                // the SSSE3 kernel); the recurrence below settles runs <= 6.
+                let long_run = r & (r << 1) & (r << 2) & (r << 3) & (r << 4) & (r << 5) & (r << 6);
+                if long_run != 0 {
+                    *pos = safe.1;
+                    return Err(safe);
+                }
+                // Effective leaders: e[i] = r[i] & !e[i-1].
+                let mut e = r & !(r << 1);
+                e = r & !(e << 1);
+                e = r & !(e << 1);
+                e = r & !(e << 1);
+                e = r & !(e << 1);
+                let fmask = (e << 1) | u64::from(carry);
+
+                let mut vl = _mm512_permutexvar_epi8(shift_idx, v);
+                vl = _mm512_mask_mov_epi8(vl, 1, _mm512_set1_epi8(prev_char as i8));
+                let b = _mm512_sub_epi8(v, c20);
+                // ev = b + 93 + 93*(prev == 0x7E); garbage on non-follower
+                // lanes is blended away (a wrapped sum there is harmless).
+                let q2 = _mm512_cmpeq_epi8_mask(vl, c7e);
+                let ev8 = _mm512_add_epi8(_mm512_add_epi8(b, c93), _mm512_maskz_mov_epi8(q2, c93));
+                // Overflow past 0xFF: q2 && b > 69 (see the doc comment).
+                let ovf = q2 & _mm512_cmpgt_epu8_mask(b, c69);
+
+                let bad = _mm512_cmpgt_epu8_mask(v, c7e) // leader > 0x7E
+                    | _mm512_cmplt_epu8_mask(v, c20) // char < 0x20
+                    | ((ovf | _mm512_cmpgt_epu8_mask(v, c7d)) & fmask); // bad escape/follower
+                if bad != 0 {
+                    *pos = safe.1;
+                    return Err(safe);
+                }
+
+                // val = follower ? esc_val : (c-0x20), plus kf (wrapping).
+                let val = _mm512_add_epi8(_mm512_mask_blend_epi8(fmask, b, ev8), kf_vec);
+
+                // Compact out the effective-leader lanes in one instruction.
+                let produced = 64 - e.count_ones() as usize;
+                _mm512_storeu_si512(
+                    dst_ptr.add(*pos).cast(),
+                    _mm512_maskz_compress_epi8(!e, val),
+                );
+                *pos += produced;
+                off += 64;
+                prev_char = *src.as_ptr().add(off - 1);
+                carry = e & (1 << 63) != 0;
+                block += 1;
+
+                // Consume a trailing pair whose follower lies in the scalar
+                // tail (see the SSSE3 kernel).
+                if carry && block == n_blocks {
+                    if let Some(c2) = src.get(off).copied() {
+                        let q15 = u32::from(prev_char) - 0x20 - 92;
+                        // Wrapping sub: c2 < 0x20 wraps past 93 and is
+                        // rejected by the same check.
+                        let b2 = u32::from(c2).wrapping_sub(0x20);
+                        let v_esc = q15.wrapping_mul(93).wrapping_add(b2);
+                        if !(1..=2).contains(&q15) || b2 > 93 || v_esc > 0xff {
+                            *pos = safe.1;
+                            return Err(safe);
+                        }
+                        *dst_ptr.add(*pos) = (v_esc as u8).wrapping_add(kf8);
+                        *pos += 1;
+                        off += 1;
+                        carry = false;
+                    } else {
+                        *pos = safe.1;
+                        return Err(safe);
+                    }
+                }
+            }
+            Ok((off, *pos))
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+        // SAFETY: feature set guaranteed by the caller; chunk loads only.
+        let vsub = _mm512_set1_epi8(sub as i8);
+        let vt = _mm512_set1_epi8(threshold as i8);
+        let mut chunks = src.chunks_exact(64);
+        let mut acc = 0u64;
+        for c in &mut chunks {
+            // SAFETY: chunk length is exactly 64 bytes.
+            let v = unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
+            let m = _mm512_cmpge_epu8_mask(_mm512_sub_epi8(v, vsub), vt);
+            acc += u64::from(m.count_ones());
+        }
+        acc as usize + super::arch::count_sub_ge(chunks.remainder(), sub, threshold)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -219,12 +470,13 @@ mod arch {
 
     /// SIMD decode fast path (see [`crate::decode_into`]).
     ///
-    /// Decodes whole 16-byte blocks of `src` (assumed `>= 0x20`, checked by
-    /// the caller) into `out` at `*p`, advancing both. On a block containing
-    /// an invalid construct the successfully decoded prefix is returned as
-    /// `Err(consumed_src, produced_dst)` so the scalar reference path can
-    /// resume there and produce the exact wire-legal error; `Ok` means every
-    /// whole block was consumed (the tail is left to the scalar path).
+    /// Decodes whole 16-byte blocks of `src` into `out` at `*p`, advancing
+    /// both; validation (including `c >= 0x20`) happens in-register. On a
+    /// block containing an invalid construct the successfully decoded prefix
+    /// is returned as `Err(consumed_src, produced_dst)` so the scalar
+    /// reference path can resume there and produce the exact wire-legal
+    /// error; `Ok` means every whole block was consumed (the tail is left
+    /// to the scalar path).
     ///
     /// Hand-off invariant: the returned source position never directly
     /// follows an unconsumed escape leader, so the scalar path never needs
@@ -263,6 +515,8 @@ mod arch {
             let foll_bound = _mm_set1_epi8(0xfdu8 as i8);
             // c > 0x7E (invalid leader) <=> flipped > 0xFE.
             let bad_bound = _mm_set1_epi8(0xfeu8 as i8);
+            // c < 0x20 <=> signed flipped < -0x60 (0x20^0x80 = 0xA0).
+            let low_bound = _mm_set1_epi8(-0x60);
             let keep15 = _mm_loadu_si128(KEEP15.as_ptr().cast());
             let lane0 = _mm_loadu_si128(LANE0.as_ptr().cast());
             let zero = _mm_setzero_si128();
@@ -287,6 +541,7 @@ mod arch {
                 let flipped = _mm_xor_si128(v, flip);
                 let raw_lead = _mm_cmpgt_epi8(flipped, lead_bound);
                 let bad_lead = _mm_movemask_epi8(_mm_cmpgt_epi8(flipped, bad_bound)) as u32;
+                let bad_low = _mm_movemask_epi8(_mm_cmpgt_epi8(low_bound, flipped)) as u32;
 
                 // Effective leaders under sequential consumption:
                 // L[i] = R[i] & ~L[i-1] — a raw leader immediately after a
@@ -357,7 +612,7 @@ mod arch {
                 let bad_foll =
                     _mm_movemask_epi8(_mm_and_si128(_mm_cmpgt_epi8(flipped, foll_bound), fmask))
                         as u32;
-                if bad_lead != 0 || bad_esc != 0 || bad_foll != 0 {
+                if bad_lead != 0 || bad_esc != 0 || bad_foll != 0 || bad_low != 0 {
                     // Invalid construct: resume from the last safe boundary
                     // (no pending cross-block pair) so the scalar reference
                     // path sees whole pairs and reports the exact error.
@@ -404,8 +659,10 @@ mod arch {
                 if carry && block == n_blocks {
                     if let Some(c2) = src.get(off).copied() {
                         let q15 = u32::from(prev_char) - 0x20 - 92;
-                        let b2 = u32::from(c2) - 0x20;
-                        let v_esc = q15.wrapping_mul(93) + b2;
+                        // Wrapping sub: c2 < 0x20 wraps past 93 and is
+                        // rejected by the same check.
+                        let b2 = u32::from(c2).wrapping_sub(0x20);
+                        let v_esc = q15.wrapping_mul(93).wrapping_add(b2);
                         if !(1..=2).contains(&q15) || b2 > 93 || v_esc > 0xff {
                             *pos = safe.1;
                             return Err(safe);
@@ -441,21 +698,6 @@ mod arch {
             acc += (unsafe { _mm_movemask_epi8(m) } as u32).count_ones();
         }
         acc as usize + super::scalar::count_sub_ge(chunks.remainder(), sub, threshold)
-    }
-
-    pub(super) fn all_ge(src: &[u8], threshold: u8) -> bool {
-        debug_assert!(threshold >= 1);
-        let vbound = unsafe { _mm_set1_epi8(((threshold - 1) ^ 0x80) as i8) };
-        let flip = unsafe { _mm_set1_epi8(-0x80_i8) };
-        let mut chunks = src.chunks_exact(16);
-        let mut ok = true;
-        for c in &mut chunks {
-            // SAFETY: chunk length is exactly 16 bytes.
-            let v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
-            let m = unsafe { _mm_cmpgt_epi8(_mm_xor_si128(v, flip), vbound) };
-            ok &= unsafe { _mm_movemask_epi8(m) } as u32 == 0xffff;
-        }
-        ok && chunks.remainder().iter().all(|&b| b >= threshold)
     }
 }
 
@@ -663,14 +905,17 @@ mod arch {
                     vmovn_u16(vcgtq_u16(ev_lo, c255_16)),
                     vmovn_u16(vcgtq_u16(ev_hi, c255_16)),
                 );
-                // Any invalid lane: bad leader (> 0x7E), escape value
-                // overflow or out-of-range follower (0x7E) on a follower
-                // lane (a 0x7D leader with a 0x7E follower evades the
-                // overflow check yet is invalid — found by cargo-fuzz on
-                // the x86_64 kernel).
+                // Any invalid lane: char < 0x20, bad leader (> 0x7E),
+                // escape value overflow or out-of-range follower (0x7E) on
+                // a follower lane (a 0x7D leader with a 0x7E follower
+                // evades the overflow check yet is invalid — found by
+                // cargo-fuzz on the x86_64 kernel).
                 let bad = vorrq_u8(
-                    vorrq_u8(bad_lead, vandq_u8(ovf, fmask)),
-                    vandq_u8(vcgtq_u8(v, bad_foll_v), fmask),
+                    vorrq_u8(vcltq_u8(v, sub20), bad_lead),
+                    vorrq_u8(
+                        vandq_u8(ovf, fmask),
+                        vandq_u8(vcgtq_u8(v, bad_foll_v), fmask),
+                    ),
                 );
                 if vmaxvq_u8(bad) != 0 {
                     // Invalid construct: roll back to the last safe boundary
@@ -714,8 +959,10 @@ mod arch {
                 if carry && block == n_blocks {
                     if let Some(c2) = src.get(off).copied() {
                         let q15 = u32::from(prev_char) - 0x20 - 92;
-                        let b2 = u32::from(c2) - 0x20;
-                        let v_esc = q15.wrapping_mul(93) + b2;
+                        // Wrapping sub: c2 < 0x20 wraps past 93 and is
+                        // rejected by the same check.
+                        let b2 = u32::from(c2).wrapping_sub(0x20);
+                        let v_esc = q15.wrapping_mul(93).wrapping_add(b2);
                         if !(1..=2).contains(&q15) || b2 > 93 || v_esc > 0xff {
                             *pos = safe.1;
                             return Err(safe);
@@ -751,20 +998,6 @@ mod arch {
         }
         acc as usize + super::scalar::count_sub_ge(chunks.remainder(), sub, threshold)
     }
-
-    pub(super) fn all_ge(src: &[u8], threshold: u8) -> bool {
-        debug_assert!(threshold >= 1);
-        let vt = unsafe { vdupq_n_u8(threshold) };
-        let mut chunks = src.chunks_exact(16);
-        let mut ok = true;
-        for c in &mut chunks {
-            // SAFETY: NEON is baseline on aarch64; chunk length is exactly
-            // 16 bytes.
-            let v = unsafe { vld1q_u8(c.as_ptr()) };
-            ok &= unsafe { vminvq_u8(vcgeq_u8(v, vt)) } == 0xff;
-        }
-        ok && chunks.remainder().iter().all(|&b| b >= threshold)
-    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -774,25 +1007,31 @@ use scalar as selected;
 
 /// Counts bytes where `b.wrapping_sub(sub) >= threshold` (`threshold >= 1`).
 pub(crate) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if arch512::have() {
+        // SAFETY: feature set verified by `have`.
+        return unsafe { arch512::count_sub_ge(src, sub, threshold) };
+    }
     selected::count_sub_ge(src, sub, threshold)
 }
 
-/// Whether every byte satisfies `b >= threshold` (`threshold >= 1`).
-pub(crate) fn all_ge(src: &[u8], threshold: u8) -> bool {
-    selected::all_ge(src, threshold)
-}
-
-/// SIMD encode fast path (x86_64 with runtime SSSE3 detection; aarch64 uses
-/// baseline NEON; other targets use the scalar loop). Returns the consumed
-/// source prefix (multiple of 16).
+/// SIMD encode fast path (x86_64: AVX-512/VBMI2 preferred with the SSSE3
+/// kernel chained for the 16..63-byte tail, both runtime-detected; aarch64
+/// uses baseline NEON; other targets use the scalar loop). Returns the
+/// consumed source prefix (multiple of 16).
 pub(crate) fn encode_simd(dst_ptr: *mut u8, p: &mut usize, src: &[u8], kf8: u8) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("ssse3") {
-            // SAFETY: SSSE3 support was just detected.
-            return unsafe { arch::encode_simd(dst_ptr, p, src, kf8) };
+        let mut consumed = 0usize;
+        if arch512::have() {
+            // SAFETY: feature set verified by `have`.
+            consumed += unsafe { arch512::encode_simd(dst_ptr, p, &src[consumed..], kf8) };
         }
-        0
+        if src.len() - consumed >= 16 && std::arch::is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 support was just detected.
+            consumed += unsafe { arch::encode_simd(dst_ptr, p, &src[consumed..], kf8) };
+        }
+        consumed
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -806,9 +1045,10 @@ pub(crate) fn encode_simd(dst_ptr: *mut u8, p: &mut usize, src: &[u8], kf8: u8) 
     }
 }
 
-/// SIMD decode fast path (x86_64 with runtime SSSE3 detection; aarch64 uses
-/// baseline NEON; other targets decode with the scalar reference loop). See
-/// the x86_64 backend for semantics.
+/// SIMD decode fast path (x86_64: AVX-512/VBMI2 preferred with the SSSE3
+/// kernel chained for the 16..63-byte tail, both runtime-detected; aarch64
+/// uses baseline NEON; other targets decode with the scalar reference loop).
+/// See the SSSE3 kernel for semantics.
 pub(crate) fn decode_simd(
     dst_ptr: *mut u8,
     p: &mut usize,
@@ -817,11 +1057,24 @@ pub(crate) fn decode_simd(
 ) -> Result<(usize, usize), (usize, usize)> {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("ssse3") {
-            // SAFETY: SSSE3 support was just detected.
-            return unsafe { arch::decode_simd(dst_ptr, p, src, kf8) };
+        let mut consumed = 0usize;
+        if arch512::have() {
+            // SAFETY: feature set verified by `have`.
+            match unsafe { arch512::decode_simd(dst_ptr, p, src, kf8) } {
+                // On success no cross-block pair is pending, so the SSSE3
+                // kernel can resume the < 64-byte tail without context.
+                Ok((c, _)) => consumed = c,
+                Err(e) => return Err(e),
+            }
         }
-        Ok((0, 0))
+        if src.len() - consumed >= 16 && std::arch::is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 support was just detected.
+            return match unsafe { arch::decode_simd(dst_ptr, p, &src[consumed..], kf8) } {
+                Ok((c2, _)) => Ok((consumed + c2, *p)),
+                Err((c2, _)) => Err((consumed + c2, *p)),
+            };
+        }
+        Ok((consumed, *p))
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -861,7 +1114,6 @@ mod tests {
                     scalar::count_sub_ge(&src, kf, 93),
                     "count n={n} kf={kf}"
                 );
-                assert_eq!(all_ge(&src, 1), scalar::all_ge(&src, 1), "all n={n}");
             }
         }
     }

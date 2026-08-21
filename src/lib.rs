@@ -7,11 +7,15 @@
 //! The format is a faithful port of openppp2 `ppp/cryptography/ssea.cpp`.
 //!
 //! Performance notes (wire output unchanged):
-//! * encode/decode run SIMD fast paths over 16-byte blocks (see `simd`): the decoder solves the
-//!   leader/follower alternation and escape reconstruction in-register and compacts leaders via a
-//!   byte-shuffle LUT (pshufb on x86_64, vqtbl1 on aarch64; ~3x over scalar); the encoder
-//!   precomputes interleaved leader/follower pairs and deletes non-escape followers through the
-//!   same LUT (~2.5x).
+//! * encode/decode run SIMD fast paths over 64-byte blocks (AVX-512
+//!   F/BW/VBMI/VBMI2 + BMI2 on x86_64, runtime-detected): the decoder solves
+//!   the leader/follower alternation on scalar `u64` masks, reconstructs
+//!   escapes in u8 lanes (`ev = b + 93 + 93*(prev == 0x7E)`) and compacts
+//!   leaders with a single `vpcompressb`; the encoder interleaves
+//!   leader/follower pairs with `vpermt2b` and drops non-escape followers
+//!   through `vpcompressb` (`pdep` spreads the escape mask). 16-byte SSSE3
+//!   (pshufb LUT) / NEON (`vqtbl1`) kernels cover smaller blocks and other
+//!   machines; validation folds into the kernels, so no upfront scan.
 //! * Invalid input and sub-block tails fall back to the scalar reference loop, so error semantics
 //!   stay bit-exact (pinned by fuzz + unit tests).
 
@@ -53,20 +57,36 @@ impl std::error::Error for DecodeError {}
 /// leader), and the write cursor advances by `1 + escape` — no mispredicted
 /// branches on the ~50/50 escape mix.
 pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
+    encode_into_with_len(out, src, kf, encoded_len(src, kf));
+}
+
+/// [`encode_into`] with a caller-computed output length, skipping the
+/// escape-count scan (`encoded_len`) when the caller already ran it for
+/// bounds checking. Frame builders need the length up front, so this halves
+/// the source scans on their hot path.
+///
+/// # Contract
+///
+/// `len` must be exactly `encoded_len(src, kf)`. A wrong value corrupts or
+/// overruns the output buffer (the writes trust `len` for capacity);
+/// `debug_assert` catches misuse in debug builds.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) {
     // 8-wide unroll: the output offsets form a short serial prefix chain
     // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
     // issue independently — a per-byte `p += 1 + esc` chain would otherwise
     // cap the loop at the address-generation latency.
     const UNROLL: usize = 8;
 
+    debug_assert_eq!(len, encoded_len(src, kf), "stale/wrong encode length");
     let kf8 = kf as u8;
-    let total = src.len() + simd::count_sub_ge(src, kf8, ESCAPE_RADIX);
+    let total = len;
     let start = out.len();
-    // +16 slack: the SIMD kernel's per-quarter compaction stores are
-    // 8-byte writes whose padding past the count is only overwritten by
-    // *later* quarters/blocks; the final store may overrun the logical
-    // length by up to 8 bytes. set_len below erases the padding.
-    out.reserve(total + 16);
+    // +64 slack: the SIMD kernels' compaction stores are full-register
+    // writes whose padding past the count is only overwritten by *later*
+    // halves/blocks; the final store may overrun the logical length.
+    // set_len below erases the padding.
+    out.reserve(total + 64);
     let dst = out.as_mut_ptr();
     let mut p = start;
     // SIMD fast path over whole 16-byte blocks first.
@@ -86,11 +106,7 @@ pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
             // Escape: c1 = 0x7D + (v >= 186), c2 = 0x20 + v - 93 - 93*(v >= 186).
             // Single: c1 = 0x20 + v (c2 unused, overwritten by a later leader).
             let q2 = u8::from(v >= 2 * ESCAPE_RADIX);
-            let c1 = if esc != 0 {
-                0x7d + q2
-            } else {
-                0x20 + v
-            };
+            let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
             let c2 = 0x20u8.wrapping_add(
                 v.wrapping_sub(ESCAPE_RADIX)
                     .wrapping_sub(ESCAPE_RADIX.wrapping_mul(q2)),
@@ -109,11 +125,7 @@ pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
         let v = b.wrapping_sub(kf8);
         let esc = u8::from(v >= ESCAPE_RADIX);
         let q2 = u8::from(v >= 2 * ESCAPE_RADIX);
-        let c1 = if esc != 0 {
-            0x7d + q2
-        } else {
-            0x20 + v
-        };
+        let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
         let c2 = 0x20u8.wrapping_add(
             v.wrapping_sub(ESCAPE_RADIX)
                 .wrapping_sub(ESCAPE_RADIX.wrapping_mul(q2)),
@@ -138,21 +150,21 @@ pub fn encoded_len(src: &[u8], kf: u32) -> usize {
 /// Decodes base94 text (see [`encode_into`]) and appends the bytes to `out`.
 /// On invalid input `out` is left unchanged and an error is returned.
 ///
-/// A SIMD bulk pass proves `>= 0x20` for every char up front and a vectorized
-/// kernel decodes whole 16-char blocks (leader/follower pairing, escape
-/// reconstruction and leader compaction in-register). Invalid constructs fall
-/// back to the scalar reference loop, which reports the exact wire-legal
-/// error; both paths are bit-exact (pinned by the fuzz test below).
+/// A vectorized kernel decodes whole blocks (leader/follower pairing, escape
+/// reconstruction and leader compaction in-register) with validation folded
+/// in; invalid constructs and sub-block tails fall back to the scalar
+/// reference loop, which reports the exact wire-legal error. Both paths are
+/// bit-exact (pinned by the fuzz test below). Chars below 0x20 are rejected
+/// by wrapping arithmetic: `c.wrapping_sub(0x20)` lands far past every
+/// range bound, so no separate validity scan is needed.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeError> {
-    if !simd::all_ge(src, 0x20) {
-        return Err(DecodeError);
-    }
     let kf8 = kf as u8;
     let kf16 = u16::from(kf8);
     let start = out.len();
-    // +16 slack for the SIMD kernel's fixed 8-byte compact stores (see
+    // +64 slack for the SIMD kernels' full-register compact stores (see
     // encode_into); the final set_len erases the padding.
-    out.reserve(src.len() + 16);
+    out.reserve(src.len() + 64);
     let dst = out.as_mut_ptr();
     let mut i;
     let mut p = start;
@@ -168,8 +180,10 @@ pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeE
     // all valid input — branching on `esc` itself would mispredict on the
     // ~50/50 escape mix.
     while i + 1 < n {
-        let b = u16::from(src[i]) - 0x20;
-        let b2 = u16::from(src[i + 1]) - 0x20;
+        // Wrapping subs: a char < 0x20 wraps past every range bound below
+        // and is rejected as an invalid escape — no upfront validity scan.
+        let b = u16::from(src[i]).wrapping_sub(0x20);
+        let b2 = u16::from(src[i + 1]).wrapping_sub(0x20);
         let esc = u16::from(b >= u16::from(ESCAPE_RADIX));
         // Escape reconstruction: v = (b - 92) * 93 + b2. Only meaningful when
         // escaping; wrapped for the single-char arm (b < 93).
@@ -185,11 +199,7 @@ pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeE
         if bad != 0 {
             return Err(DecodeError);
         }
-        let val = if esc != 0 {
-            v_esc
-        } else {
-            b
-        };
+        let val = if esc != 0 { v_esc } else { b };
         // SAFETY: at most one output byte per input char, and `p` advanced
         // only by committed bytes within the reserved capacity.
         unsafe { *dst.add(p) = val.wrapping_add(kf16) as u8 };
@@ -198,7 +208,8 @@ pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeE
     }
     if i < n {
         // Trailing single char; an escape leader here is a truncated pair.
-        let b = src[i] - 0x20;
+        // (A char < 0x20 wraps to >= 0xE1 and is rejected by the same check.)
+        let b = src[i].wrapping_sub(0x20);
         if b >= ESCAPE_RADIX {
             return Err(DecodeError);
         }
