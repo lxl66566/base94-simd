@@ -18,6 +18,9 @@ name    = "codec"
 
 [dependencies]
 hotpath = { version = "0.23", optional = true }
+# Experiment: SIMD kernels rewritten on the fearless_simd portable API.
+# Local fork checkout; not published.
+fearless_simd = { path = "../fork/fearless_simd/fearless_simd", optional = true }
 
 [dev-dependencies]
 criterion   = { version = "0.8", default-features = false, features = [
@@ -37,6 +40,9 @@ hotpath = ["dep:hotpath", "hotpath/hotpath"]
 # key-mixing variants (`*_kf`): bytes are pre-mixed as `(b - kf) mod 256`
 # before encoding. Off by default; the plain codec is the `kf = 0` identity either way.
 kf      = []
+# Experiment: route encode/decode/len through `simd_fearless` instead of the
+# hand-written intrinsics backends (both stay compiled for A/B benchmarking).
+fearless = ["dep:fearless_simd"]
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }

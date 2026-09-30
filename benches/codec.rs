@@ -111,5 +111,64 @@ fn bench_decode(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_decode);
+// ---- fearless_simd vs intrinsics A/B (experiment) ----
+
+fn backend_benches(c: &mut Criterion) {
+    use base94_simd::ab;
+
+    for name in ["encode", "decode", "len"] {
+        let mut g = c.benchmark_group(format!("{name}-backend"));
+        for size in [64usize, 1024, 16 * 1024, 64 * 1024, 1024 * 1024] {
+            let data = sample(size);
+            let mut encoded = Vec::new();
+            base94_simd::encode_into(&mut encoded, &data);
+            g.throughput(Throughput::Bytes(size as u64));
+            match name {
+                "encode" => {
+                    g.bench_with_input(BenchmarkId::new("intrinsics", size), &data, |b, data| {
+                        let mut out = Vec::new();
+                        b.iter(|| {
+                            out.clear();
+                            ab::encode_into_intr(black_box(&mut out), black_box(data));
+                        });
+                    });
+                    g.bench_with_input(BenchmarkId::new("fearless", size), &data, |b, data| {
+                        let mut out = Vec::new();
+                        b.iter(|| {
+                            out.clear();
+                            ab::encode_into_fear(black_box(&mut out), black_box(data));
+                        });
+                    });
+                },
+                "decode" => {
+                    g.bench_with_input(BenchmarkId::new("intrinsics", size), &encoded, |b, enc| {
+                        let mut out = Vec::new();
+                        b.iter(|| {
+                            out.clear();
+                            ab::decode_into_intr(black_box(&mut out), black_box(enc)).unwrap();
+                        });
+                    });
+                    g.bench_with_input(BenchmarkId::new("fearless", size), &encoded, |b, enc| {
+                        let mut out = Vec::new();
+                        b.iter(|| {
+                            out.clear();
+                            ab::decode_into_fear(black_box(&mut out), black_box(enc)).unwrap();
+                        });
+                    });
+                },
+                _ => {
+                    g.bench_with_input(BenchmarkId::new("intrinsics", size), &data, |b, data| {
+                        b.iter(|| ab::encoded_len_intr(black_box(data)));
+                    });
+                    g.bench_with_input(BenchmarkId::new("fearless", size), &data, |b, data| {
+                        b.iter(|| ab::encoded_len_fear(black_box(data)));
+                    });
+                },
+            }
+        }
+        g.finish();
+    }
+}
+
+criterion_group!(benches, bench_encode, bench_decode, backend_benches);
 criterion_main!(benches);

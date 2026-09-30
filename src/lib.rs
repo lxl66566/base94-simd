@@ -28,7 +28,76 @@
 
 mod simd;
 
+// Experiment: selectable SIMD backend. The default is the hand-written
+// intrinsics implementation; the `fearless` feature routes the public API
+// through the fearless_simd rewrite. Both stay compiled for A/B benches.
+mod backend {
+    /// SIMD fast-path surface shared by the intrinsics and fearless backends.
+    pub(crate) trait Backend {
+        fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize;
+        fn encode_simd<const KF: bool>(dst: *mut u8, p: &mut usize, src: &[u8], kf8: u8) -> usize;
+        fn decode_simd<const KF: bool>(
+            dst: *mut u8,
+            p: &mut usize,
+            src: &[u8],
+            kf8: u8,
+        ) -> Result<(usize, usize), (usize, usize)>;
+    }
+
+    pub(crate) enum Intrinsics {}
+
+    impl Backend for Intrinsics {
+        fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
+            crate::simd::count_sub_ge::<KF>(src, sub, threshold)
+        }
+
+        fn encode_simd<const KF: bool>(dst: *mut u8, p: &mut usize, src: &[u8], kf8: u8) -> usize {
+            crate::simd::encode_simd::<KF>(dst, p, src, kf8)
+        }
+
+        fn decode_simd<const KF: bool>(
+            dst: *mut u8,
+            p: &mut usize,
+            src: &[u8],
+            kf8: u8,
+        ) -> Result<(usize, usize), (usize, usize)> {
+            crate::simd::decode_simd::<KF>(dst, p, src, kf8)
+        }
+    }
+
+    #[cfg(feature = "fearless")]
+    pub(crate) enum Fearless {}
+
+    #[cfg(feature = "fearless")]
+    impl Backend for Fearless {
+        fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
+            crate::simd_fearless::count_sub_ge::<KF>(src, sub, threshold)
+        }
+
+        fn encode_simd<const KF: bool>(dst: *mut u8, p: &mut usize, src: &[u8], kf8: u8) -> usize {
+            crate::simd_fearless::encode_simd::<KF>(dst, p, src, kf8)
+        }
+
+        fn decode_simd<const KF: bool>(
+            dst: *mut u8,
+            p: &mut usize,
+            src: &[u8],
+            kf8: u8,
+        ) -> Result<(usize, usize), (usize, usize)> {
+            crate::simd_fearless::decode_simd::<KF>(dst, p, src, kf8)
+        }
+    }
+}
+
+#[cfg(feature = "fearless")]
+mod simd_fearless;
+
 use std::fmt;
+
+#[cfg(feature = "fearless")]
+use backend::Fearless as Selected;
+#[cfg(not(feature = "fearless"))]
+use backend::Intrinsics as Selected;
 
 /// Number of printable symbols: 0x20..=0x7E.
 pub const SYMBOL_COUNT: u8 = 94;
@@ -52,7 +121,7 @@ impl std::error::Error for DecodeError {}
 
 /// Encodes binary bytes into printable 0x20..=0x7E chars, appending to `out`.
 pub fn encode_into(out: &mut Vec<u8>, src: &[u8]) {
-    encode_impl::<false>(out, src, 0, encoded_len(src));
+    encode_impl::<false, Selected>(out, src, 0, encoded_len(src));
 }
 
 /// [`encode_into`] with a caller-computed output length, skipping the
@@ -66,13 +135,13 @@ pub fn encode_into(out: &mut Vec<u8>, src: &[u8]) {
 /// overruns the output buffer (the writes trust `len` for capacity);
 /// `debug_assert` catches misuse in debug builds.
 pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], len: usize) {
-    encode_impl::<false>(out, src, 0, len);
+    encode_impl::<false, Selected>(out, src, 0, len);
 }
 
 /// Number of chars [`encode_into`] would emit for `src`.
 #[must_use]
 pub fn encoded_len(src: &[u8]) -> usize {
-    len_impl::<false>(src, 0)
+    len_impl::<false, Selected>(src, 0)
 }
 
 /// Key-mixing variant of [`encode_into`] (openppp2 wire compatibility):
@@ -80,29 +149,29 @@ pub fn encoded_len(src: &[u8]) -> usize {
 /// low byte of `kf` participates.
 #[cfg(feature = "kf")]
 pub fn encode_into_kf(out: &mut Vec<u8>, src: &[u8], kf: u32) {
-    encode_impl::<true>(out, src, kf as u8, encoded_len_kf(src, kf));
+    encode_impl::<true, Selected>(out, src, kf as u8, encoded_len_kf(src, kf));
 }
 
 /// Key-mixing variant of [`encode_into_with_len`]; `len` must be exactly
 /// `encoded_len_kf(src, kf)` (same contract).
 #[cfg(feature = "kf")]
 pub fn encode_into_with_len_kf(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) {
-    encode_impl::<true>(out, src, kf as u8, len);
+    encode_impl::<true, Selected>(out, src, kf as u8, len);
 }
 
 /// Number of chars [`encode_into_kf`] would emit for `src`.
 #[cfg(feature = "kf")]
 #[must_use]
 pub fn encoded_len_kf(src: &[u8], kf: u32) -> usize {
-    len_impl::<true>(src, kf as u8)
+    len_impl::<true, Selected>(src, kf as u8)
 }
 
 /// `KF=false` instantiations erase every mix/unmix op at compile time
 /// (monomorphized const branch), so the plain codec carries zero kf
 /// overhead; `kf8` must be 0 there.
-fn len_impl<const KF: bool>(src: &[u8], kf8: u8) -> usize {
+fn len_impl<const KF: bool, B: backend::Backend>(src: &[u8], kf8: u8) -> usize {
     debug_assert!(KF || kf8 == 0);
-    src.len() + simd::count_sub_ge::<KF>(src, kf8, ESCAPE_RADIX)
+    src.len() + B::count_sub_ge::<KF>(src, kf8, ESCAPE_RADIX)
 }
 
 /// `(b - kf) mod 256` when `KF`, identity otherwise (compile-time).
@@ -130,7 +199,12 @@ const fn unmix<const KF: bool>(b: u8, kf8: u8) -> u8 {
 /// overwritten by the next leader), and the write cursor advances by
 /// `1 + escape` — no mispredicted branches on the ~50/50 escape mix.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usize) {
+fn encode_impl<const KF: bool, B: backend::Backend>(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    kf8: u8,
+    len: usize,
+) {
     // 8-wide unroll: the output offsets form a short serial prefix chain
     // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
     // issue independently — a per-byte `p += 1 + esc` chain would otherwise
@@ -138,7 +212,11 @@ fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usiz
     const UNROLL: usize = 8;
 
     debug_assert!(KF || kf8 == 0);
-    debug_assert_eq!(len, len_impl::<KF>(src, kf8), "stale/wrong encode length");
+    debug_assert_eq!(
+        len,
+        len_impl::<KF, B>(src, kf8),
+        "stale/wrong encode length"
+    );
     let total = len;
     let start = out.len();
     // +64 slack: the SIMD kernels' compaction stores are full-register
@@ -149,7 +227,7 @@ fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usiz
     let dst = out.as_mut_ptr();
     let mut p = start;
     // SIMD fast path over whole blocks first.
-    let simd_consumed = simd::encode_simd::<KF>(dst, &mut p, src, kf8);
+    let simd_consumed = B::encode_simd::<KF>(dst, &mut p, src, kf8);
     let mut idx = simd_consumed;
     while idx + UNROLL <= src.len() {
         let chunk: [u8; UNROLL] = src[idx..idx + UNROLL].try_into().expect("fixed size");
@@ -211,13 +289,13 @@ fn encode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8, len: usiz
 /// Decodes base94 text (see [`encode_into`]) and appends the bytes to `out`.
 /// On invalid input `out` is left unchanged and an error is returned.
 pub fn decode_into(out: &mut Vec<u8>, src: &[u8]) -> Result<(), DecodeError> {
-    decode_impl::<false>(out, src, 0)
+    decode_impl::<false, Selected>(out, src, 0)
 }
 
 /// Key-mixing variant of [`decode_into`] (see [`encode_into_kf`]).
 #[cfg(feature = "kf")]
 pub fn decode_into_kf(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeError> {
-    decode_impl::<true>(out, src, kf as u8)
+    decode_impl::<true, Selected>(out, src, kf as u8)
 }
 
 /// Shared decode body.
@@ -230,7 +308,11 @@ pub fn decode_into_kf(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), Deco
 /// by wrapping arithmetic: `c.wrapping_sub(0x20)` lands far past every
 /// range bound, so no separate validity scan is needed.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn decode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8) -> Result<(), DecodeError> {
+fn decode_impl<const KF: bool, B: backend::Backend>(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    kf8: u8,
+) -> Result<(), DecodeError> {
     debug_assert!(KF || kf8 == 0);
     let start = out.len();
     // +64 slack for the SIMD kernels' full-register compact stores (see
@@ -243,7 +325,7 @@ fn decode_impl<const KF: bool>(out: &mut Vec<u8>, src: &[u8], kf8: u8) -> Result
     // SIMD fast path over whole 16-char blocks. `Ok` leaves the sub-block
     // tail; `Err` hands back the last valid prefix. Either way the scalar
     // reference loop resumes exactly where the kernel stopped.
-    match simd::decode_simd::<KF>(dst, &mut p, src, kf8) {
+    match B::decode_simd::<KF>(dst, &mut p, src, kf8) {
         Ok((consumed, _)) | Err((consumed, _)) => i = consumed,
     }
     // Main loop: every position still has a potential follower char. The
@@ -336,6 +418,45 @@ pub fn decimal_decode(s: &[u8]) -> Result<u64, DecodeError> {
     Ok(n)
 }
 
+/// A/B benchmark access for both SIMD backends (experiment; the default
+/// backend stays reachable through the public API).
+#[cfg(feature = "fearless")]
+#[doc(hidden)]
+pub mod ab {
+    use super::backend::{Fearless, Intrinsics};
+
+    #[doc(hidden)]
+    pub fn encode_into_intr(out: &mut Vec<u8>, src: &[u8]) {
+        super::encode_impl::<false, Intrinsics>(out, src, 0, super::encoded_len(src));
+    }
+
+    #[doc(hidden)]
+    pub fn encode_into_fear(out: &mut Vec<u8>, src: &[u8]) {
+        super::encode_impl::<false, Fearless>(out, src, 0, super::encoded_len(src));
+    }
+
+    #[doc(hidden)]
+    pub fn decode_into_intr(out: &mut Vec<u8>, src: &[u8]) -> Result<(), super::DecodeError> {
+        super::decode_impl::<false, Intrinsics>(out, src, 0)
+    }
+
+    #[doc(hidden)]
+    pub fn decode_into_fear(out: &mut Vec<u8>, src: &[u8]) -> Result<(), super::DecodeError> {
+        super::decode_impl::<false, Fearless>(out, src, 0)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encoded_len_intr(src: &[u8]) -> usize {
+        super::len_impl::<false, Intrinsics>(src, 0)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encoded_len_fear(src: &[u8]) -> usize {
+        super::len_impl::<false, Fearless>(src, 0)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

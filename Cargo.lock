@@ -58,6 +58,7 @@ name = "base94-simd"
 version = "0.1.1"
 dependencies = [
  "criterion",
+ "fearless_simd",
  "hotpath",
  "num-bigint",
  "num-integer",
@@ -248,6 +249,10 @@ name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
+
+[[package]]
+name = "fearless_simd"
+version = "1.0.0"
 
 [[package]]
 name = "find-msvc-tools"
