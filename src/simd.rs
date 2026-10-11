@@ -167,7 +167,11 @@ mod arch512 {
     /// AVX-512 encode kernel; same contract as the SSSE3 kernel except the
     /// caller must reserve 64 bytes of store slack (the final compaction
     /// store writes a full register).
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2")]
+    // Experience: keep these lists complete for anything the body uses, not
+    // just the SIMD features. Missing `popcnt` made `mask.count_ones()` compile
+    // to a ~12-op SWAR sequence in every loop (decode ran ~35% slower at 16 KiB,
+    // count ~2.2x slower); missing `bmi1` cost `andn` fusion in the recurrence.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi1,bmi2,popcnt")]
     pub(super) fn encode_simd<const KF: bool>(
         dst_ptr: *mut u8,
         pos: &mut usize,
@@ -249,7 +253,7 @@ mod arch512 {
     /// `p` in {0x7D, 0x7E}, `ev = b + 93 + 93*(p == 0x7E)`, and overflow
     /// past 0xFF happens exactly when `p == 0x7E && b > 69` — no widening
     /// to u16 lanes (and back) needed.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi1,bmi2,popcnt")]
     #[allow(clippy::too_many_lines)]
     pub(super) fn decode_simd<const KF: bool>(
         dst_ptr: *mut u8,
@@ -371,7 +375,7 @@ mod arch512 {
         }
     }
 
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f,avx512bw,bmi1,bmi2,popcnt")]
     pub(super) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
         // SAFETY: feature set guaranteed by the caller; chunk loads only.
         let vsub = _mm512_set1_epi8(sub as i8);
