@@ -282,9 +282,13 @@ mod arch512 {
             let mut prev_char = 0u8;
             let mut safe = (0usize, 0usize);
             let mut block = 0usize;
+            // Keep the write cursor in a register; `*pos` is written back only
+            // on the exit paths (writing through the reference inside the
+            // loop forces a per-block reload+store).
+            let mut pos_v = *pos;
             while block < n_blocks {
                 if !carry {
-                    safe = (off, *pos);
+                    safe = (off, pos_v);
                 }
                 let v = _mm512_loadu_si512(src.as_ptr().add(off).cast());
                 let mut r = _mm512_cmpge_epu8_mask(v, c7d);
@@ -335,10 +339,10 @@ mod arch512 {
                 // Compact out the effective-leader lanes in one instruction.
                 let produced = 64 - e.count_ones() as usize;
                 _mm512_storeu_si512(
-                    dst_ptr.add(*pos).cast(),
+                    dst_ptr.add(pos_v).cast(),
                     _mm512_maskz_compress_epi8(!e, val),
                 );
-                *pos += produced;
+                pos_v += produced;
                 off += 64;
                 prev_char = *src.as_ptr().add(off - 1);
                 carry = e & (1 << 63) != 0;
@@ -357,12 +361,12 @@ mod arch512 {
                             *pos = safe.1;
                             return Err(safe);
                         }
-                        *dst_ptr.add(*pos) = if KF {
+                        *dst_ptr.add(pos_v) = if KF {
                             (v_esc as u8).wrapping_add(kf8)
                         } else {
                             v_esc as u8
                         };
-                        *pos += 1;
+                        pos_v += 1;
                         off += 1;
                         carry = false;
                     } else {
@@ -371,7 +375,8 @@ mod arch512 {
                     }
                 }
             }
-            Ok((off, *pos))
+            *pos = pos_v;
+            Ok((off, pos_v))
         }
     }
 

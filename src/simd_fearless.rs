@@ -50,6 +50,32 @@ fn cached_level() -> Level {
 
 /// Counts bytes where `b.wrapping_sub(sub) >= threshold` (`threshold >= 1`).
 pub(crate) fn count_sub_ge<const KF: bool>(src: &[u8], sub: u8, threshold: u8) -> usize {
+    // Experiment: hand-rolled `#[target_feature]` wrapper around the generic
+    // kernel instead of `dispatch!`/`vectorize`. The wrapper's feature
+    // context lets every portable op inline and fuse into one loop, without
+    // the macro's closure crossing a non-inlinable boundary (closure env via
+    // memory, ~3 cycles/call on small inputs). Cost: the dispatch safety is
+    // now this crate's job (caller must match the detected level).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Feature set must be a superset of every op's `kernel!` list
+        // (the full Ice Lake set), or LLVM refuses to inline the ops into
+        // this context and the kernel de-fuses.
+        #[target_feature(enable = "adx,aes,avx512bitalg,avx512bw,avx512cd,avx512dq,avx512f,avx512ifma,avx512vbmi,avx512vbmi2,avx512vl,avx512vnni,avx512vpopcntdq,bmi1,bmi2,cmpxchg16b,fma,fxsr,gfni,lzcnt,movbe,pclmulqdq,popcnt,rdrand,rdseed,sha,vaes,vpclmulqdq,xsave,xsavec,xsaveopt,xsaves")]
+        unsafe fn count512<const KF: bool>(
+            avx: Avx512,
+            src: &[u8],
+            sub: u8,
+            threshold: u8,
+        ) -> usize {
+            count_kernel::<KF, _>(avx, src, sub, threshold)
+        }
+        if let Level::Avx512(avx) = cached_level() {
+            // SAFETY: level runtime-detected above; the wrapper's feature
+            // set covers everything count_kernel instantiates at this level.
+            return unsafe { count512::<KF>(avx, src, sub, threshold) };
+        }
+    }
     dispatch!(
         cached_level(),
         simd => count_kernel::<KF, _>(simd, src, sub, threshold)
@@ -490,7 +516,9 @@ fn decode512<const KF: bool>(
         store64_at(dst_ptr, pos_v, compress_b512(avx, val, !e));
         pos_v += produced;
         off += 64;
-        prev_char = src[off - 1];
+        // chunk[63]: compile-time in-bounds index; `src[off - 1]` kept a
+        // per-block bounds-check + panic edge in the loop.
+        prev_char = chunk[63];
         carry = e & (1 << 63) != 0;
 
         // Consume a trailing pair whose follower lies in the scalar tail

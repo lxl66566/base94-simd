@@ -16,6 +16,12 @@ include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/sr
 harness = false
 name    = "codec"
 
+# Deterministic instruction-count A/B for the two SIMD backends (Valgrind);
+# arbitrates when wall-clock rounds disagree (CPU frequency drift).
+[[bench]]
+harness = false
+name    = "gungraun_ab"
+
 [dependencies]
 hotpath = { version = "0.23", optional = true }
 # Experiment: SIMD kernels rewritten on the fearless_simd portable API.
@@ -32,6 +38,7 @@ criterion   = { version = "0.8", default-features = false, features = [
 num-bigint  = { version = "0.5", default-features = false }
 num-integer = { version = "0.1", default-features = false }
 num-traits  = { version = "0.2", default-features = false }
+gungraun    = "0.19.4"
 
 [features]
 # Profiling instrumentation (noop and zero-cost when off); the encode/decode
@@ -60,3 +67,8 @@ unused_qualifications = "warn"
 
 [profile.release]
 codegen-units = 1
+
+# gungraun needs symbols in the bench profile.
+[profile.bench]
+debug = true
+strip = false
